@@ -1,0 +1,11 @@
+name: sfemu
+
+# A local Snowflake emulator speaking the driver protocol, backed by DuckDB.
+# State is in memory: every container start is a fresh emulator.
+
+services:
+  sfemu:
+    build: .
+    image: sfemu:latest
+    ports:
+      - "8085:8085"

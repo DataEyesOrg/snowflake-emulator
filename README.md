@@ -54,6 +54,16 @@ with running_server() as server:
 
 Each `running_server()` is a fresh, empty emulator on a free port.
 
+### In Docker
+
+```sh
+docker compose up        # or: docker build -t sfemu . && docker run -p 8085:8085 sfemu
+```
+
+Point drivers at `host: 127.0.0.1`, `port: 8085`, `protocol: http`. State is
+in memory; restarting the container resets the emulator. (The image is new
+and not yet exercised in CI.)
+
 ## What works
 
 Verified with `snowflake-connector-python` 5.2 (the test suite) and 3.15 / 4.8
