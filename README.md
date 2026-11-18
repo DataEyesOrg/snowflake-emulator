@@ -56,16 +56,18 @@ Each `running_server()` is a fresh, empty emulator on a free port.
 
 ## What works
 
-Verified with `snowflake-connector-python` 5.2:
+Verified with `snowflake-connector-python` 5.2 (the test suite) and 3.15 / 4.8
+(by hand):
 
 | Area | Supported |
 |---|---|
-| Protocol | login, query, logout; JSON result format |
+| Protocol | login, query, logout; JSON and Arrow result formats |
 | Queries | `SELECT` and set operations, translated by sqlglot |
 | DML | `INSERT`, `UPDATE`, `DELETE`, with Snowflake's row-count result sets |
 | DDL | `CREATE` / `DROP` for databases, schemas, tables, views; `TRUNCATE` |
-| Session | `USE`, `ALTER SESSION`, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
+| Session | `USE`, `ALTER SESSION`, login session parameters, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
 | Binding | client-side (pyformat) and positional `?` for numbers, text, booleans |
+| Results | Arrow for `fetch_pandas_all` / `get_result_batches`; large results in downloadable chunks |
 | Errors | Snowflake error codes and SQLSTATEs for the common failures |
 
 Token renewal and heartbeat are implemented and tested over plain HTTP, but
@@ -75,6 +77,12 @@ Statements outside this list are rejected with Snowflake's
 `000002 (0A000): Unsupported feature` instead of being passed to DuckDB. A
 statement that passes here by accident and fails on Snowflake is worse than
 one that fails here honestly.
+
+Results follow the format the driver negotiated at login: a driver asking for
+Arrow (`PYTHON_CONNECTOR_QUERY_RESULT_FORMAT=arrow`, the Python connector's
+default when pyarrow is installed) gets Arrow for `SELECT`s, including large
+results split into downloadable chunks; other statements answer in JSON, as
+they do on Snowflake.
 
 ## Known differences from Snowflake
 

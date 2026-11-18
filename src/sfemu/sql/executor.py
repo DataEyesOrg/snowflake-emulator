@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
 import duckdb
+import pyarrow as pa
 from sqlglot import exp
 
 from sfemu import errors
+from sfemu.arrow import ipc_stream, snowflake_table
 from sfemu.engine import DEFAULT_SCHEMA, Engine
 from sfemu.errors import SnowflakeError
 from sfemu.session import Session
@@ -34,8 +37,22 @@ USE = 0x4300
 TRANSACTION = 0x5000
 DDL = 0x6000
 
+# Result formats a driver can ask for; SELECT answers in the requested one,
+# everything else stays JSON (drivers read DML row counts from the rowset).
+ARROW = "arrow"
+JSON = "json"
+
 _SUCCESS = "Statement executed successfully."
 _RELATION_KINDS = {"TABLE": "Table", "VIEW": "View"}
+
+
+@dataclass
+class ResultChunk:
+    """One downloadable part of a large result, served behind its chunk URL."""
+
+    row_count: int
+    arrow: bytes | None = None  # an Arrow IPC stream, when the result is Arrow
+    rows: list[list[str | None]] | None = None  # JSON-encoded rows otherwise
 
 
 @dataclass
@@ -44,6 +61,13 @@ class QueryResult:
     rows: list[list[str | None]]
     statement_type_id: int
     query_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    total: int | None = None
+    arrow: bytes | None = None  # the inline first chunk, as an Arrow IPC stream
+    chunks: list[ResultChunk] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.total is None:
+            self.total = len(self.rows)
 
 
 def _status(message: str, statement_type_id: int) -> QueryResult:
@@ -111,11 +135,42 @@ class Executor:
         self._run(session, statement, params)
         cursor = session.cursor
         columns = [column_from_duckdb(d[0], d[1]) for d in cursor.description]
+        chunk_rows = _chunk_rows(session)
+        if _result_format(session) == ARROW:
+            # Arrow output on a DB-API result copies once more than the
+            # relational API would; that copy is the price of parameters.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                table = snowflake_table(cursor.to_arrow_table(), columns)
+            parts: list[pa.RecordBatch] = table.to_batches(max_chunksize=chunk_rows)
+            if not parts:  # an empty result still needs one, schema-carrying batch
+                parts = [
+                    pa.record_batch(
+                        [pa.array([], type=f.type) for f in table.schema], schema=table.schema
+                    )
+                ]
+            arrow_chunks = [
+                ResultChunk(row_count=batch.num_rows, arrow=ipc_stream([batch]))
+                for batch in parts[1:]
+            ]
+            return QueryResult(
+                columns,
+                [],
+                SELECT,
+                total=table.num_rows,
+                arrow=ipc_stream([parts[0]]),
+                chunks=arrow_chunks,
+            )
         rows = [
             [encode_value(value, column) for value, column in zip(row, columns, strict=True)]
             for row in cursor.fetchall()
         ]
-        return QueryResult(columns, rows, SELECT)
+        first, rest = rows[:chunk_rows], rows[chunk_rows:]
+        chunks = [
+            ResultChunk(row_count=len(rest[i : i + chunk_rows]), rows=rest[i : i + chunk_rows])
+            for i in range(0, len(rest), chunk_rows)
+        ]
+        return QueryResult(columns, first, SELECT, total=len(rows), chunks=chunks)
 
     def _dml(
         self,
@@ -369,3 +424,21 @@ def _no_current(what: str, action: str) -> SnowflakeError:
         f"Cannot perform {action}. This session does not have a current {what}. "
         f"Call 'USE {what.upper()}', or use a qualified name.",
     )
+
+
+def _result_format(session: Session) -> str:
+    """The result format the driver asked for at login, if we speak it."""
+    for name in ("QUERY_RESULT_FORMAT", "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT"):
+        value = session.parameters.get(name)
+        if isinstance(value, str) and value.lower() == ARROW:
+            return ARROW
+    return JSON
+
+
+def _chunk_rows(session: Session) -> int:
+    """Rows per result chunk; Snowflake's default is 160."""
+    try:
+        size = int(session.parameters.get("CLIENT_RESULT_CHUNK_SIZE", 160))
+    except (TypeError, ValueError):
+        return 160
+    return max(1, min(65_536, size))

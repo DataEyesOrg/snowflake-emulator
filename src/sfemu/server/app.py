@@ -7,24 +7,27 @@ open-source connectors. Every response uses the same envelope:
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 import logging
 import re
+import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from sfemu import __version__, errors
 from sfemu.engine import Engine
 from sfemu.errors import SnowflakeError
 from sfemu.session import Session, SessionManager
-from sfemu.sql.executor import Executor, QueryResult
+from sfemu.sql.executor import Executor, QueryResult, ResultChunk
 
 log = logging.getLogger("sfemu")
 
@@ -32,12 +35,38 @@ log = logging.getLogger("sfemu")
 SERVER_VERSION = "9.0.0"
 _TOKEN = re.compile(r'Snowflake Token="([^"]*)"')
 _HOUR = 3600
+# Large results are dropped after this many queries; drivers fetch chunks
+# right after the query, so this only bounds memory.
+_KEPT_RESULTS = 128
+
+
+class ResultStore:
+    """Downloadable result chunks, kept until their query ages out."""
+
+    def __init__(self, capacity: int = _KEPT_RESULTS) -> None:
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._chunks: OrderedDict[str, list[ResultChunk]] = OrderedDict()
+
+    def add(self, query_id: str, chunks: list[ResultChunk]) -> None:
+        with self._lock:
+            self._chunks[query_id] = chunks
+            while len(self._chunks) > self._capacity:
+                self._chunks.popitem(last=False)
+
+    def get(self, query_id: str, index: int) -> ResultChunk | None:
+        with self._lock:
+            chunks = self._chunks.get(query_id)
+        if chunks is None or not 0 <= index < len(chunks):
+            return None
+        return chunks[index]
 
 
 def create_app(*, auto_create: bool = True) -> Starlette:
     engine = Engine()
     sessions = SessionManager(engine, auto_create=auto_create)
     executor = Executor(engine)
+    results = ResultStore()
 
     def authenticate(request: Request) -> Session:
         session = sessions.get(_token(request))
@@ -48,6 +77,7 @@ def create_app(*, auto_create: bool = True) -> Starlette:
     async def login(request: Request) -> JSONResponse:
         data = (await _body(request)).get("data") or {}
         query = request.query_params
+        parameters = data.get("SESSION_PARAMETERS")
         session = await run_in_threadpool(
             sessions.login,
             user=str(data.get("LOGIN_NAME") or "").upper(),
@@ -56,6 +86,7 @@ def create_app(*, auto_create: bool = True) -> Starlette:
             schema=_object_name(query.get("schemaName")),
             warehouse=_object_name(query.get("warehouse")),
             role=_object_name(query.get("roleName")),
+            parameters=parameters if isinstance(parameters, dict) else None,
         )
         log.info("login user=%s session=%s", session.user, session.id)
         return _ok(
@@ -80,7 +111,30 @@ def create_app(*, auto_create: bool = True) -> Starlette:
         sql = body.get("sqlText") or ""
         log.debug("query session=%s sql=%s", session.id, sql)
         result = await run_in_threadpool(executor.execute, session, sql, body.get("bindings"))
-        return _ok(_query_data(session, result))
+        if result.chunks:
+            results.add(result.query_id, result.chunks)
+        return _ok(_query_data(request, session, result))
+
+    async def result_chunk(request: Request) -> Response:
+        # Chunk URLs carry an unguessable query id, so like Snowflake's own
+        # presigned chunk downloads no further credential is checked.
+        chunk = results.get(request.path_params["query_id"], int(request.path_params["index"]))
+        if chunk is None:
+            return JSONResponse({"success": False, "code": "404001", "message": "Not found"}, 404)
+        if chunk.arrow is not None:
+            # Snowflake serves arrow chunks gzip-compressed; drivers sniff the
+            # magic bytes rather than the Content-Encoding header.
+            return Response(
+                gzip.compress(chunk.arrow),
+                media_type="application/octet-stream",
+                headers={"Content-Encoding": "gzip"},
+            )
+        # JSON chunks are the result rows as concatenated JSON arrays, with no
+        # outer bracket: drivers wrap them in one ("[" + body + "]") or stream
+        # the arrays one by one.
+        rows = [[cell for cell in row] for row in chunk.rows or []]
+        body = gzip.compress(json.dumps(rows)[1:-1].encode())
+        return Response(body, media_type="application/json", headers={"Content-Encoding": "gzip"})
 
     async def session_endpoint(request: Request) -> JSONResponse:
         session = authenticate(request)
@@ -129,6 +183,7 @@ def create_app(*, auto_create: bool = True) -> Starlette:
             Route("/session/token-request", renew_token, methods=["POST"]),
             Route("/session/heartbeat", acknowledge, methods=["GET", "POST"]),
             Route("/telemetry/send", acknowledge, methods=["POST"]),
+            Route("/results/{query_id}/{index:int}", result_chunk, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
         ],
         exception_handlers={SnowflakeError: on_snowflake_error},
@@ -173,13 +228,11 @@ def _session_info(session: Session) -> dict[str, str | None]:
     }
 
 
-def _query_data(session: Session, result: QueryResult) -> dict[str, Any]:
-    return {
+def _query_data(request: Request, session: Session, result: QueryResult) -> dict[str, Any]:
+    data: dict[str, Any] = {
         "parameters": session.parameter_list(),
         "rowtype": [column.to_rowtype() for column in result.columns],
-        "rowset": result.rows,
-        "total": len(result.rows),
-        "returned": len(result.rows),
+        "total": result.total,
         "queryId": result.query_id,
         "sqlState": "00000",
         "databaseProvider": None,
@@ -192,5 +245,27 @@ def _query_data(session: Session, result: QueryResult) -> dict[str, Any]:
         "statementTypeId": result.statement_type_id,
         "version": 1,
         "sendResultTime": int(time.time() * 1000),
-        "queryResultFormat": "json",
+        "queryAbortsAfterSecs": 0,
     }
+    if result.arrow is not None:
+        data["queryResultFormat"] = "arrow"
+        data["rowsetBase64"] = base64.b64encode(result.arrow).decode()
+    else:
+        data["queryResultFormat"] = "json"
+        data["rowset"] = result.rows
+        data["returned"] = len(result.rows)
+    if result.chunks:
+        base = str(request.base_url).rstrip("/")
+        data["chunks"] = [
+            {
+                "url": f"{base}/results/{result.query_id}/{index}",
+                "rowCount": chunk.row_count,
+                "uncompressedRows": chunk.row_count,
+                "uncompressedSize": len(chunk.arrow) if chunk.arrow is not None else 0,
+                "compressedSize": len(chunk.arrow) if chunk.arrow is not None else 0,
+            }
+            for index, chunk in enumerate(result.chunks)
+        ]
+        # Drivers replay these headers verbatim on chunk downloads.
+        data["chunkHeaders"] = {"Authorization": f'Snowflake Token="{session.token}"'}
+    return data

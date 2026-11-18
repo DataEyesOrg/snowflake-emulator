@@ -10,6 +10,7 @@ from typing import Any
 
 import duckdb
 
+from sfemu import errors
 from sfemu.engine import DEFAULT_SCHEMA, Engine, quote
 
 # Parameters drivers read from the login and query responses. UTC is a
@@ -80,6 +81,7 @@ class SessionManager:
         schema: str | None,
         warehouse: str | None,
         role: str | None,
+        parameters: dict[str, Any] | None = None,
     ) -> Session:
         session = Session(
             id=next(self._ids),
@@ -91,6 +93,15 @@ class SessionManager:
             warehouse=warehouse,
             role=role or "PUBLIC",
         )
+        # Snowflake applies the login parameters and echoes them back; that
+        # echo is how a driver learns the server agreed to e.g. Arrow results.
+        session.parameters.update({str(k).upper(): v for k, v in (parameters or {}).items()})
+        timezone = session.parameters.get("TIMEZONE")
+        if isinstance(timezone, str):
+            try:
+                session.cursor.execute("SET TimeZone = ?", [timezone])
+            except duckdb.Error as exc:
+                raise errors.from_duckdb(exc) from exc
         self._enter_namespace(session, database, schema)
         with self._lock:
             self._by_token[session.token] = session
