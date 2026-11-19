@@ -2,33 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import urllib.request
 from typing import Any
 
 import pytest
 
-from sfemu.testing import RunningServer
-
-
-def call(server: RunningServer, path: str, body: Any, token: str | None = None) -> dict[str, Any]:
-    request = urllib.request.Request(
-        f"http://{server.host}:{server.port}{path}",
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f'Snowflake Token="{token}"',
-        },
-    )
-    # The emulator is local; never route these calls through a configured proxy.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request) as response:
-        return json.load(response)
-
-
-def login(server: RunningServer) -> dict[str, Any]:
-    body = {"data": {"LOGIN_NAME": "test", "PASSWORD": "test", "ACCOUNT_NAME": "test"}}
-    return call(server, "/session/v1/login-request", body)["data"]
+from helpers import call, login
 
 
 def test_query_without_a_session_is_refused(server):

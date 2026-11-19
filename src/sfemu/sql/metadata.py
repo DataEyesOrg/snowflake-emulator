@@ -9,6 +9,7 @@ dates from the moment the emulator started.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from typing import Any
 
@@ -86,6 +87,7 @@ def show(
     database: str | None,
     schema: str | None,
     started: dt.datetime,
+    primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]],
 ) -> Rows:
     """Answer a SHOW command for a session whose current namespace is given."""
     what = str(statement.name).upper()
@@ -98,9 +100,143 @@ def show(
     elif what in ("OBJECTS", "TABLES", "VIEWS"):
         scope = _scope(cursor, statement, database, schema, default="SCHEMA")
         columns, rows = _show_objects(cursor, what, terse, scope, started)
+    elif what in ("COLUMNS", "PRIMARY KEYS"):
+        scope = _table_scope(cursor, statement, database, schema)
+        if what == "COLUMNS":
+            return _show_columns(cursor, scope)
+        return _show_primary_keys(cursor, scope, primary_keys, started)
     else:
         raise errors.unsupported(f"SHOW {what}")
     return columns, _narrow(statement, columns, rows)
+
+
+def _table_scope(
+    cursor: duckdb.DuckDBPyConnection,
+    statement: exp.Show,
+    database: str | None,
+    schema: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """The (database, schema, table) a SHOW COLUMNS or SHOW PRIMARY KEYS covers."""
+    kind = str(statement.args.get("scope_kind") or "").upper()
+    target = statement.args.get("scope")
+    if kind not in ("TABLE", "VIEW") or target is None:
+        return (*_scope(cursor, statement, database, schema, default="SCHEMA"), None)
+    table_database = target.catalog or database
+    table_schema = target.db or schema
+    where = "database_name = ? AND schema_name = ? AND name = ?"
+    if (
+        table_database is None
+        or table_schema is None
+        or not _exists(cursor, _OBJECTS_SQL, where, [table_database, table_schema, target.name])
+    ):
+        raise errors.object_not_found(f"Table '{target.name}' does not exist or not authorized.")
+    return table_database, table_schema, target.name
+
+
+def _show_columns(
+    cursor: duckdb.DuckDBPyConnection, scope: tuple[str | None, str | None, str | None]
+) -> Rows:
+    where, params = _where(scope[0], scope[1])
+    if scope[2] is not None:
+        where, params = f"{where} AND table_name = ?", [*params, scope[2]]
+    found = _select(
+        cursor,
+        _COLUMNS_SQL,
+        where,
+        params,
+        order="database_name, schema_name, table_name, column_index",
+    )
+    columns = _columns(
+        "table_name schema_name column_name data_type null? default kind expression comment "
+        "database_name autoincrement schema_evolution_record"
+    )
+    rows = [
+        [
+            table,
+            schema,
+            column,
+            _type_json(type_name, precision, scale, nullable),
+            "true" if nullable else "false",
+            default or "",
+            "COLUMN",
+            "",
+            comment or "",
+            database,
+            "",
+            None,
+        ]
+        for (database, schema, table, column, _i, default, nullable, comment, type_name,
+             precision, scale) in found
+    ]  # fmt: skip
+    return columns, rows
+
+
+# The "type" SHOW COLUMNS puts in its data_type JSON, where it differs.
+_JSON_TYPES = {"NUMBER": "FIXED", "FLOAT": "REAL"}
+
+
+def _type_json(name: str, precision: int, scale: int, nullable: bool) -> str:
+    described: dict[str, Any] = {"type": _JSON_TYPES.get(name, name)}
+    if name == "NUMBER":
+        described.update(precision=precision, scale=scale)
+    elif name in ("TIME", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ"):
+        described.update(precision=0, scale=9)
+    elif name in ("TEXT", "BINARY"):
+        length = 16_777_216 if name == "TEXT" else 8_388_608
+        described.update(length=length, byteLength=length)
+    described["nullable"] = bool(nullable)
+    if name in ("TEXT", "BINARY"):
+        described["fixed"] = False
+    return json.dumps(described, separators=(",", ":"))
+
+
+def _show_primary_keys(
+    cursor: duckdb.DuckDBPyConnection,
+    scope: tuple[str | None, str | None, str | None],
+    primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]],
+    started: dt.datetime,
+) -> Rows:
+    columns = _columns(
+        "created_on:ts database_name schema_name table_name column_name key_sequence:n "
+        "constraint_name rely comment"
+    )
+    existing = {row[:3] for row in _select(cursor, _OBJECTS_SQL)}
+    rows = []
+    for key in sorted(primary_keys):
+        if key not in existing or any(
+            wanted is not None and wanted != part for wanted, part in zip(scope, key, strict=True)
+        ):
+            continue
+        constraint, key_columns = primary_keys[key]
+        for position, column in enumerate(key_columns, start=1):
+            rows.append([started, *key, column, position, constraint, "false", None])
+    return columns, rows
+
+
+def show_parameters(parameters: dict[str, Any], defaults: dict[str, Any], like: str | None) -> Rows:
+    """SHOW PARAMETERS: the session parameters the emulator keeps."""
+    columns = _columns("key value default level description type")
+    pattern = re.compile(_like_regex(like or "%"), re.IGNORECASE | re.DOTALL)
+    rows = []
+    for key in sorted(parameters):
+        if not pattern.fullmatch(key):
+            continue
+        value, default = parameters[key], defaults.get(key)
+        kind = (
+            "BOOLEAN" if isinstance(value, bool) else "NUMBER" if isinstance(value, int | float)
+            else "STRING"
+        )  # fmt: skip
+        level = "" if key in defaults and value == default else "SESSION"
+        rows.append([key, _parameter_text(value), _parameter_text(default), level, "", kind])
+    return columns, rows
+
+
+def _parameter_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _scope(
@@ -287,7 +423,13 @@ def _like_regex(pattern: str) -> str:
 # DESCRIBE ----------------------------------------------------------------------
 
 
-def describe(cursor: duckdb.DuckDBPyConnection, database: str, schema: str, name: str) -> Rows:
+def describe(
+    cursor: duckdb.DuckDBPyConnection,
+    database: str,
+    schema: str,
+    name: str,
+    primary_key: list[str],
+) -> Rows:
     """DESCRIBE TABLE or VIEW; the relation is known to exist."""
     found = _select(
         cursor,
@@ -307,7 +449,7 @@ def describe(cursor: duckdb.DuckDBPyConnection, database: str, schema: str, name
             "COLUMN",
             _yn(nullable),
             default,
-            "N",
+            _yn(column_name in primary_key),
             "N",
             None,
             None,

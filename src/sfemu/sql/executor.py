@@ -11,13 +11,15 @@ import contextlib
 import datetime as dt
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 import duckdb
 import pyarrow as pa
+import sqlglot
 from sqlglot import exp
 
 from sfemu import errors
@@ -35,6 +37,7 @@ INSERT = 0x3100
 UPDATE = 0x3200
 DELETE = 0x3300
 MERGE = 0x3500
+MULTI_STATEMENT = 0xA000
 ALTER_SESSION = 0x4100
 USE = 0x4300
 TRANSACTION = 0x5000
@@ -77,6 +80,9 @@ class QueryResult:
     arrow: bytes | None = None  # the inline first chunk, as an Arrow IPC stream
     chunks: list[ResultChunk] = field(default_factory=list)
     bind_count: int = 0
+    # The per-statement results of a multi-statement request, which itself
+    # answers with a one-line status; drivers fetch these by query id.
+    children: list[QueryResult] = field(default_factory=list)
     # Whether a driver may send this statement once with a column of values per
     # bind; drivers ask with a describe-only request before executemany().
     array_bind_supported: bool = False
@@ -143,6 +149,74 @@ def _pop_overwrite(session: Session, statement: exp.Expression) -> str | None:
     return "DELETE FROM {}.{}.{}".format(*(quote(part) for part in key))
 
 
+def _primary_key_of(node: exp.Expression) -> tuple[str, list[str]] | None:
+    """The (constraint name, columns) of a table-level PRIMARY KEY inside a node."""
+    primary = node.find(exp.PrimaryKey)
+    if primary is None:
+        return None
+    constraint = primary.find_ancestor(exp.Constraint)
+    name = constraint.name if constraint is not None else ""
+    return name or _constraint_name(), [column.name for column in primary.expressions]
+
+
+def _is_drop_primary_key(action: exp.Expression) -> bool:
+    # sqlglot keeps this ALTER TABLE action as raw text.
+    if not isinstance(action, exp.Command):
+        return False
+    words = f"{action.this} {action.expression or ''}".upper().split()
+    return words == ["DROP", "PRIMARY", "KEY"]
+
+
+def _constraint_name() -> str:
+    return f"SYS_CONSTRAINT_{uuid.uuid4()}"
+
+
+_KEY_CONSTRAINTS = (exp.PrimaryKeyColumnConstraint, exp.UniqueColumnConstraint)
+_REFERENCES = (exp.Reference, exp.ForeignKey)
+_TABLE_CONSTRAINTS = (exp.Constraint, exp.PrimaryKey, exp.ForeignKey, *_KEY_CONSTRAINTS)
+
+
+def _pop_column_constraints(column: exp.ColumnDef) -> str | None:
+    """Strip PRIMARY KEY, UNIQUE and REFERENCES from a column; return the key's name if any.
+
+    Snowflake records these constraints and does not enforce them, DuckDB
+    would. A primary key column is NOT NULL, which both do enforce.
+    """
+    key_name = None
+    for constraint in list(column.args.get("constraints") or []):
+        if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+            key_name = constraint.name or _constraint_name()
+            constraint.set("kind", exp.NotNullColumnConstraint())
+            constraint.set("this", None)
+        elif isinstance(constraint.kind, (exp.UniqueColumnConstraint, *_REFERENCES)):
+            constraint.pop()
+    return key_name
+
+
+def _pop_constraints(statement: exp.Create) -> tuple[str, list[str]] | None:
+    """Strip the key constraints of a CREATE TABLE; return its primary key, if it has one."""
+    schema = statement.this
+    if not isinstance(schema, exp.Schema):
+        return None  # CREATE TABLE ... AS SELECT without a column list
+    primary_key = None
+    columns: dict[str, exp.ColumnDef] = {}
+    for item in list(schema.expressions):
+        if isinstance(item, exp.ColumnDef):
+            columns[item.name] = item
+            key_name = _pop_column_constraints(item)
+            if key_name is not None:
+                primary_key = (key_name, [item.name])
+        elif isinstance(item, _TABLE_CONSTRAINTS):
+            primary_key = _primary_key_of(item) or primary_key
+            item.pop()
+    for name in primary_key[1] if primary_key else []:
+        column = columns.get(name)
+        if column is not None and not column.find(exp.NotNullColumnConstraint):
+            not_null = exp.ColumnConstraint(kind=exp.NotNullColumnConstraint())
+            column.append("constraints", not_null)
+    return primary_key
+
+
 def _pop_temporary(statement: exp.Create) -> bool:
     """Remove TEMPORARY from a CREATE TABLE and say whether it was there."""
     properties = statement.args.get("properties")
@@ -182,34 +256,82 @@ class Executor:
         bindings: dict[str, Any] | None = None,
         *,
         describe_only: bool = False,
+        statement_count: int | None = None,
     ) -> QueryResult:
-        """Run one statement, or with describe_only just report its result columns."""
+        """Run the SQL text of one request.
+
+        ``statement_count`` is the request's MULTI_STATEMENT_COUNT: how many
+        statements the text must hold, or 0 for any number. Without it the
+        session's parameter decides, and that defaults to exactly one. With
+        ``describe_only`` nothing runs and only the result columns come back.
+        """
         statements = translate.parse(sql)
         if not statements:
             raise SnowflakeError("000900", "42601", "SQL compilation error:\nEmpty SQL statement.")
-        if len(statements) > 1:
+        if statement_count is None:
+            statement_count = _statement_count(session)
+        if statement_count not in (0, len(statements)):
             raise SnowflakeError(
                 "000008",
                 "0A000",
                 f"Actual statement count {len(statements)} "
-                "did not match the desired statement count 1.",
+                f"did not match the desired statement count {statement_count}.",
             )
-        statement = statements[0]
-        binds = translate.bind_count(statement)
-        rows = _bind_rows(bindings)
         with session.lock:
             try:
-                if describe_only:
-                    result = self._describe_only(session, statement, binds)
-                elif rows is None:
-                    result = self._dispatch(session, statement, _bind_values(bindings))
-                else:
-                    result = self._dispatch_rows(session, statement, rows)
+                if len(statements) == 1:
+                    return self._execute_one(session, statements[0], bindings, describe_only)
+                return self._execute_many(session, statements, bindings, describe_only)
             except duckdb.Error as exc:
                 raise errors.from_duckdb(exc) from exc
+
+    def _execute_one(
+        self,
+        session: Session,
+        statement: exp.Expression,
+        bindings: dict[str, Any] | None,
+        describe_only: bool,
+    ) -> QueryResult:
+        binds = translate.bind_count(statement)
+        rows = _bind_rows(bindings)
+        if describe_only:
+            result = self._describe_only(session, statement, binds)
+        elif rows is None:
+            result = self._dispatch(session, statement, _bind_values(bindings))
+        else:
+            result = self._dispatch_rows(session, statement, rows)
         result.bind_count = binds
         result.array_bind_supported = isinstance(statement, exp.Insert)
         return result
+
+    def _execute_many(
+        self,
+        session: Session,
+        statements: list[exp.Expression],
+        bindings: dict[str, Any] | None,
+        describe_only: bool,
+    ) -> QueryResult:
+        """A multi-statement request: run the statements in order, keep every result.
+
+        As on Snowflake, a failing statement fails the request, and whatever
+        ran before it stays done.
+        """
+        if describe_only:
+            raise errors.unsupported("describe of a multi-statement request")
+        if _bind_rows(bindings) is not None:
+            raise errors.unsupported("array bind in a multi-statement request")
+        params = _bind_values(bindings)  # consumed left to right, statement by statement
+        children = []
+        for statement in statements:
+            binds = translate.bind_count(statement)
+            child = self._dispatch(session, statement, params[:binds])
+            child.bind_count = binds
+            params = params[binds:]
+            children.append(child)
+        parent = _status("Multiple statements executed successfully.", MULTI_STATEMENT)
+        parent.columns = [text_column("multiple statement execution", nullable=False)]
+        parent.children = children
+        return parent
 
     def _describe_only(
         self, session: Session, statement: exp.Expression, binds: int
@@ -292,7 +414,10 @@ class Executor:
             if head == "SHOW" and rest.split()[:1] and rest.split()[0].upper() == "GRANTS":
                 return _rows_result(metadata.GRANTS, [])
             if head == "ALTER":
+                self._commit_before_ddl(session)
                 return self._alter_column_comments(session, f"ALTER {rest}")
+            if head == "SHOW" and rest.split()[:1] and rest.split()[0].upper() == "PARAMETERS":
+                return _rows_result(*self._show_parameters(session, f"SHOW {rest}"))
         if isinstance(statement, exp.Transaction | exp.Commit | exp.Rollback):
             return self._transaction(session, statement)
         raise errors.unsupported(_describe(statement))
@@ -440,8 +565,21 @@ class Executor:
                     f"not specified type '{kind}'.",
                 )
             temporary = _pop_temporary(statement)
+            primary_key = _pop_constraints(statement) if kind == "TABLE" else None
+            if kind == "VIEW":
+                # Pin what the view reads to where it resolves now, as Snowflake
+                # does; the definition then survives a move to another schema.
+                for table in translate.relations(statement):
+                    if table is not target:
+                        resolved = _qualify(session, table)
+                        table.set("catalog", exp.to_identifier(resolved[0], quoted=True))
+                        table.set("db", exp.to_identifier(resolved[1], quoted=True))
             self._run(session, statement, params, creating=target)
             key = (database, schema, name)
+            if primary_key is not None:
+                self._engine.primary_keys[key] = primary_key
+            else:
+                self._engine.primary_keys.pop(key, None)
             if temporary:
                 session.temporary_tables.add(key)
             else:
@@ -481,6 +619,7 @@ class Executor:
                 statement.set("cascade", False)
                 session.cursor.execute(translate.to_duckdb(statement))
                 session.temporary_tables.discard(_qualify(session, target))
+                self._engine.primary_keys.pop(_qualify(session, target), None)
         else:
             raise errors.unsupported(f"DROP {kind}")
 
@@ -495,48 +634,146 @@ class Executor:
     def _alter(self, session: Session, statement: exp.Alter) -> QueryResult:
         kind = statement.args["kind"]
         target = statement.this
+        actions = statement.args.get("actions") or []
+        for action in actions:
+            # The tables a constraint refers to need not be checked, or exist.
+            if isinstance(action, exp.AddConstraint):
+                for reference in list(action.find_all(exp.Reference)):
+                    reference.pop()
         self._require_namespace(session, statement)
-        database, schema, name = _qualify(session, target)
+        key = _qualify(session, target)
         if self._kind(session, target) != kind:
             if statement.args.get("exists"):
                 return _status(_SUCCESS, DDL)
             label = _RELATION_KINDS[kind]
-            raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
-        relation = f"{quote(database)}.{quote(schema)}.{quote(name)}"
-        commands = []
-        for action in statement.args.get("actions") or []:
+            raise errors.object_not_found(f"{label} '{key[2]}' does not exist or not authorized.")
+        relation = ".".join(quote(part) for part in key)
+        cursor = session.cursor
+        steps: list[Callable[[], Any]] = []
+        for action in actions:
             if isinstance(action, exp.AlterRename):
-                new_database, new_schema, new_name = _qualify(session, action.this)
-                if (new_database, new_schema) != (database, schema):
-                    raise errors.unsupported(f"ALTER {kind} RENAME TO another schema")
+                new_key = _qualify(session, action.this)
                 if self._kind(session, action.this) is not None:
-                    raise _already_exists(new_name)
-                commands.append(f"ALTER {kind} {relation} RENAME TO {quote(new_name)}")
-                if (database, schema, name) in session.temporary_tables:
-                    session.temporary_tables.discard((database, schema, name))
-                    session.temporary_tables.add((database, schema, new_name))
+                    raise _already_exists(new_key[2])
+                steps.append(partial(self._relocate, session, kind, key, new_key))
+            elif isinstance(action, exp.SwapTable):
+                other = _qualify(session, action.this)
+                if kind != "TABLE" or self._kind(session, action.this) != "TABLE":
+                    raise errors.object_not_found(
+                        f"Table '{other[2]}' does not exist or not authorized."
+                    )
+                # Three moves through a name nobody else can be using.
+                parked = (key[0], key[1], f"sfemu_swap_{uuid.uuid4().hex}")
+                steps.append(partial(self._relocate, session, kind, key, parked))
+                steps.append(partial(self._relocate, session, kind, other, key))
+                steps.append(partial(self._relocate, session, kind, parked, other))
             elif isinstance(action, exp.AlterSet):
-                commands.append(_comment_sql(kind, relation, _set_comment(kind, action)))
+                sql = _comment_sql(kind, relation, _set_comment(kind, action))
+                steps.append(partial(cursor.execute, sql))
             elif isinstance(action, exp.AlterColumn) and action.args.get("comment") is not None:
                 column = f"{relation}.{quote(action.name)}"
-                commands.append(_comment_sql("COLUMN", column, action.args["comment"].name))
+                sql = _comment_sql("COLUMN", column, action.args["comment"].name)
+                steps.append(partial(cursor.execute, sql))
+            elif isinstance(action, exp.AddConstraint):
+                primary_key = _primary_key_of(action)
+                if primary_key is not None:
+                    steps.append(partial(self._engine.primary_keys.__setitem__, key, primary_key))
+                # UNIQUE and FOREIGN KEY: not enforced by Snowflake, not recorded here.
+            elif isinstance(action, exp.Drop) and action.args.get("kind") == "CONSTRAINT":
+                steps.append(partial(self._drop_primary_key, key, action.name))
+            elif _is_drop_primary_key(action):
+                steps.append(partial(self._drop_primary_key, key, None))
             elif isinstance(action, exp.ColumnDef | exp.Drop | exp.RenameColumn | exp.AlterColumn):
                 # DuckDB runs one action per ALTER statement.
+                if isinstance(action, exp.ColumnDef):
+                    _pop_column_constraints(action)
                 single = exp.Alter(this=target.copy(), kind=kind, actions=[action.copy()])
                 translate.check_supported(single)
-                commands.append(translate.to_duckdb(single))
+                steps.append(partial(cursor.execute, translate.to_duckdb(single)))
+                if isinstance(action, exp.RenameColumn):
+                    renamed = (action.this.name, action.args["to"].name)
+                    steps.append(partial(self._rename_key_column, key, *renamed))
             else:
                 raise errors.unsupported(f"ALTER {kind} ... {action.key.upper()}")
         with _atomic(session):
-            for command in commands:
-                session.cursor.execute(command)
+            for step in steps:
+                step()
         return _status(_SUCCESS, DDL)
+
+    def _drop_primary_key(self, key: tuple[str, str, str], constraint: str | None) -> None:
+        """Forget a table's primary key; with a name, only if that is its constraint."""
+        found = self._engine.primary_keys.get(key)
+        if found is not None and constraint in (None, found[0]):
+            del self._engine.primary_keys[key]
+
+    def _rename_key_column(self, key: tuple[str, str, str], old: str, new: str) -> None:
+        found = self._engine.primary_keys.get(key)
+        if found is not None:
+            columns = [new if column == old else column for column in found[1]]
+            self._engine.primary_keys[key] = (found[0], columns)
+
+    def _relocate(
+        self,
+        session: Session,
+        kind: str,
+        old: tuple[str, str, str],
+        new: tuple[str, str, str],
+    ) -> None:
+        """Rename a table or view, moving it to another schema if the new name says so."""
+        cursor = session.cursor
+        old_name = ".".join(quote(part) for part in old)
+        new_name = ".".join(quote(part) for part in new)
+        if old[:2] == new[:2]:
+            cursor.execute(f"ALTER {kind} {old_name} RENAME TO {quote(new[2])}")
+        elif old[0] != new[0]:
+            # DuckDB cannot write to two databases in one transaction.
+            raise errors.unsupported(f"ALTER {kind} RENAME TO another database")
+        else:
+            # DuckDB cannot move a relation between schemas: recreate it from
+            # its own definition, copy the rows and comments, drop the original.
+            if not self._engine.has_schema(new[0], new[1]):
+                raise errors.object_not_found(
+                    f"Schema '{new[1]}' does not exist or not authorized."
+                )
+            source, column = ("duckdb_tables()", "table_name")
+            if kind == "VIEW":
+                source, column = ("duckdb_views()", "view_name")
+            where = f"database_name = ? AND schema_name = ? AND {column} = ?"
+            definition, comment = cursor.execute(
+                f"SELECT sql, comment FROM {source} WHERE {where}", list(old)
+            ).fetchone()
+            create = sqlglot.parse_one(definition, read=translate.DUCKDB)
+            target = create.this.this if isinstance(create.this, exp.Schema) else create.this
+            target.replace(exp.table_(new[2], db=new[1], catalog=new[0], quoted=True))
+            cursor.execute(create.sql(dialect=translate.DUCKDB, identify=True))
+            if kind == "TABLE":
+                cursor.execute(f"INSERT INTO {new_name} SELECT * FROM {old_name}")
+            if comment:
+                cursor.execute(_comment_sql(kind, new_name, comment))
+            comments = cursor.execute(
+                "SELECT column_name, comment FROM duckdb_columns() "
+                "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+                "AND comment IS NOT NULL",
+                list(old),
+            ).fetchall()
+            for column_name, text in comments:
+                cursor.execute(_comment_sql("COLUMN", f"{new_name}.{quote(column_name)}", text))
+            cursor.execute(f"DROP {kind} {old_name}")
+        if old in session.temporary_tables:
+            session.temporary_tables.discard(old)
+            session.temporary_tables.add(new)
+        primary_key = self._engine.primary_keys.pop(old, None)
+        if primary_key is not None:
+            self._engine.primary_keys[new] = primary_key
 
     def _alter_column_comments(self, session: Session, sql: str) -> QueryResult:
         """ALTER TABLE t ALTER [COLUMN] a COMMENT '..', b COMMENT '..' — dbt's persist_docs."""
         tokens = translate.tokens(sql)
         kinds = [kind for kind, _ in tokens]
         unsupported = errors.unsupported("ALTER")
+        drop_key = [text.upper() for _, text in tokens[-3:]] == ["DROP", "PRIMARY", "KEY"]
+        if drop_key:
+            tokens, kinds = [*tokens[:-3], ("ALTER", "")], [*kinds[:-3], "ALTER"]
         if kinds[:2] != ["ALTER", "TABLE"] or "ALTER" not in kinds[2:]:
             raise unsupported
         split = kinds.index("ALTER", 2)
@@ -568,6 +805,9 @@ class Executor:
             if if_exists:
                 return _status(_SUCCESS, DDL)
             raise errors.object_not_found(f"Table '{table_name}' does not exist or not authorized.")
+        if drop_key:
+            self._drop_primary_key((database, schema, table_name), None)
+            return _status(_SUCCESS, DDL)
         relation = f"{quote(database)}.{quote(schema)}.{quote(table_name)}"
         with _atomic(session):
             for column, text in comments:
@@ -638,8 +878,22 @@ class Executor:
             database=session.database,
             schema=session.schema,
             started=self._engine.started,
+            primary_keys=self._engine.primary_keys,
         )
         return _rows_result(columns, rows)
+
+    def _show_parameters(self, session: Session, sql: str) -> metadata.Rows:
+        """SHOW PARAMETERS [LIKE '...'] [IN SESSION]; other scopes are not kept."""
+        tokens = translate.tokens(sql)[2:]
+        like = None
+        if tokens and tokens[0][0] == "LIKE":
+            if len(tokens) < 2 or "STRING" not in tokens[1][0]:
+                raise errors.syntax_error("SHOW PARAMETERS LIKE needs a pattern.")
+            like, tokens = tokens[1][1], tokens[2:]
+        scope = [text.upper() for _, text in tokens]
+        if scope not in ([], ["IN", "SESSION"], ["FOR", "SESSION"]):
+            raise errors.unsupported(f"SHOW PARAMETERS {' '.join(scope)}")
+        return metadata.show_parameters(session.parameters, DEFAULT_PARAMETERS, like)
 
     def _describe_relation(self, session: Session, statement: exp.Describe) -> QueryResult:
         kind = str(statement.args.get("kind") or "TABLE").upper()
@@ -653,7 +907,9 @@ class Executor:
         if found is None or (kind == "VIEW" and found != "VIEW"):
             label = _RELATION_KINDS[kind]
             raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
-        return _rows_result(*metadata.describe(session.cursor, database, schema, name))
+        primary_key = self._engine.primary_keys.get((database, schema, name), ("", []))[1]
+        described = metadata.describe(session.cursor, database, schema, name, primary_key)
+        return _rows_result(*described)
 
     def _drop_database(self, session: Session, name: str) -> None:
         if session.database == name:
@@ -905,6 +1161,14 @@ def _no_current(what: str, action: str) -> SnowflakeError:
         f"Cannot perform {action}. This session does not have a current {what}. "
         f"Call 'USE {what.upper()}', or use a qualified name.",
     )
+
+
+def _statement_count(session: Session) -> int:
+    """How many statements one request may hold; Snowflake's default is 1, and 0 is any."""
+    try:
+        return max(0, int(session.parameters.get("MULTI_STATEMENT_COUNT", 1)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _result_format(session: Session) -> str:

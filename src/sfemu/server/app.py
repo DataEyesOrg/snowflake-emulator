@@ -35,31 +35,40 @@ log = logging.getLogger("sfemu")
 SERVER_VERSION = "9.0.0"
 _TOKEN = re.compile(r'Snowflake Token="([^"]*)"')
 _HOUR = 3600
-# Large results are dropped after this many queries; drivers fetch chunks
-# right after the query, so this only bounds memory.
-_KEPT_RESULTS = 128
+# Results are dropped after this many queries; drivers fetch them right after
+# the query, so this only bounds memory.
+_KEPT_RESULTS = 256
 
 
 class ResultStore:
-    """Downloadable result chunks, kept until their query ages out."""
+    """Results of recent queries, by query id.
+
+    Drivers come back for them: for the chunks of a large result, for each
+    statement of a multi-statement request, or when asked for the result of
+    an earlier query. The oldest are dropped; Snowflake keeps them a day.
+    """
 
     def __init__(self, capacity: int = _KEPT_RESULTS) -> None:
         self._capacity = capacity
         self._lock = threading.Lock()
-        self._chunks: OrderedDict[str, list[ResultChunk]] = OrderedDict()
+        self._results: OrderedDict[str, QueryResult] = OrderedDict()
 
-    def add(self, query_id: str, chunks: list[ResultChunk]) -> None:
+    def add(self, result: QueryResult) -> None:
         with self._lock:
-            self._chunks[query_id] = chunks
-            while len(self._chunks) > self._capacity:
-                self._chunks.popitem(last=False)
+            for kept in (result, *result.children):
+                self._results[kept.query_id] = kept
+            while len(self._results) > self._capacity:
+                self._results.popitem(last=False)
 
-    def get(self, query_id: str, index: int) -> ResultChunk | None:
+    def get(self, query_id: str) -> QueryResult | None:
         with self._lock:
-            chunks = self._chunks.get(query_id)
-        if chunks is None or not 0 <= index < len(chunks):
+            return self._results.get(query_id)
+
+    def chunk(self, query_id: str, index: int) -> ResultChunk | None:
+        result = self.get(query_id)
+        if result is None or not 0 <= index < len(result.chunks):
             return None
-        return chunks[index]
+        return result.chunks[index]
 
 
 def create_app(*, auto_create: bool = True) -> Starlette:
@@ -116,15 +125,32 @@ def create_app(*, auto_create: bool = True) -> Starlette:
             sql,
             body.get("bindings"),
             describe_only=bool(body.get("describeOnly")),
+            statement_count=_statement_count(body),
         )
-        if result.chunks:
-            results.add(result.query_id, result.chunks)
+        results.add(result)
         return _ok(_query_data(request, session, result))
+
+    async def query_result(request: Request) -> JSONResponse:
+        session = authenticate(request)
+        result = results.get(request.path_params["query_id"])
+        if result is None:
+            raise errors.query_not_found(request.path_params["query_id"])
+        return _ok(_query_data(request, session, result))
+
+    async def query_status(request: Request) -> JSONResponse:
+        # Statements run to completion inside the request, so a known query has
+        # always succeeded; a failed one was never stored.
+        authenticate(request)
+        # Connector 5.x asks for /monitoring/queries//<id>, with a doubled slash.
+        query_id = request.path_params["query_id"].strip("/")
+        known = results.get(query_id) is not None
+        queries = [{"id": query_id, "status": "SUCCESS", "state": "SUCCEEDED"}] if known else []
+        return _ok({"queries": queries})
 
     async def result_chunk(request: Request) -> Response:
         # Chunk URLs carry an unguessable query id, so like Snowflake's own
         # presigned chunk downloads no further credential is checked.
-        chunk = results.get(request.path_params["query_id"], int(request.path_params["index"]))
+        chunk = results.chunk(request.path_params["query_id"], int(request.path_params["index"]))
         if chunk is None:
             return JSONResponse({"success": False, "code": "404001", "message": "Not found"}, 404)
         if chunk.arrow is not None:
@@ -200,6 +226,8 @@ def create_app(*, auto_create: bool = True) -> Starlette:
         routes=[
             Route("/session/v1/login-request", guarded(login), methods=["POST"]),
             Route("/queries/v1/query-request", guarded(query), methods=["POST"]),
+            Route("/queries/{query_id}/result", guarded(query_result), methods=["GET", "POST"]),
+            Route("/monitoring/queries/{query_id:path}", guarded(query_status), methods=["GET"]),
             Route("/session", guarded(session_endpoint), methods=["POST"]),
             Route("/session/token-request", guarded(renew_token), methods=["POST"]),
             Route("/session/heartbeat", acknowledge, methods=["GET", "POST"]),
@@ -231,6 +259,17 @@ async def _body(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise errors.bad_request("the body must be a JSON object")
     return body
+
+
+def _statement_count(body: dict[str, Any]) -> int | None:
+    """The MULTI_STATEMENT_COUNT a request carries, if any."""
+    parameters = body.get("parameters")
+    if not isinstance(parameters, dict) or "MULTI_STATEMENT_COUNT" not in parameters:
+        return None
+    try:
+        return max(0, int(parameters["MULTI_STATEMENT_COUNT"]))
+    except (TypeError, ValueError) as exc:
+        raise errors.bad_request("MULTI_STATEMENT_COUNT must be a number") from exc
 
 
 def _object_name(raw: str | None) -> str | None:
@@ -281,6 +320,10 @@ def _query_data(request: Request, session: Session, result: QueryResult) -> dict
         data["queryResultFormat"] = "json"
         data["rowset"] = result.rows
         data["returned"] = len(result.rows)
+    if result.children:
+        # A multi-statement request: drivers fetch each of these by its id.
+        data["resultIds"] = ",".join(child.query_id for child in result.children)
+        data["resultTypes"] = ",".join(str(child.statement_type_id) for child in result.children)
     if result.chunks:
         base = str(request.base_url).rstrip("/")
         data["chunks"] = [

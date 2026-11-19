@@ -42,6 +42,10 @@ def internal(detail: str) -> SnowflakeError:
     return SnowflakeError("000603", "XX000", f"SQL execution internal error:\n{detail}")
 
 
+def query_not_found(query_id: str) -> SnowflakeError:
+    return SnowflakeError("000709", "02000", f"Statement {query_id} not found")
+
+
 def session_gone() -> SnowflakeError:
     return SnowflakeError(
         "390111", "08001", "Session no longer exists. New login required to access the service."

@@ -37,11 +37,14 @@ sqlglot, совместимый по протоколу с драйверами 
 - [x] DDL фиксирует открытую транзакцию, как в Snowflake
 - [x] `dbt seed` / `run` / `test` / `snapshot` / `build` / `docs generate`
       зелёные на jaffle_shop и на тестовом проекте `tests/dbt_project`
-- [ ] multi-statement в протоколе (`MULTI_STATEMENT_COUNT`); dbt он не нужен,
-      оба движка делят скрипт на операторы сами
+- [x] multi-statement в протоколе (`MULTI_STATEMENT_COUNT`), результат и
+      статус запроса по query ID
+- [x] `SHOW COLUMNS` / `PARAMETERS` / `PRIMARY KEYS`; первичные ключи
+      запоминаются и не навязываются
+- [x] `ALTER TABLE ... SWAP WITH`, переименование в другую схему той же базы
 - [ ] один реальный dbt-проект — вторая половина критерия готовности
-- [ ] `SHOW COLUMNS` / `PARAMETERS` / `PRIMARY KEYS`, `ALTER TABLE ... SWAP WITH`,
-      переименование в другую схему
+- [ ] `RESULT_SCAN` (нужен коннекторам 3.x / 4.x для `get_results_from_sfqid`),
+      `SHOW UNIQUE KEYS` / `IMPORTED KEYS`, переименование в другую базу
 
 Фаза 0 пропущена и остаётся открытой: спайк на fakesnow и conformance-тесты
 против настоящего аккаунта ещё не сделаны.

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
-from snowflake.connector import DictCursor, ProgrammingError
+from snowflake.connector import DatabaseError, DictCursor, ProgrammingError
 
 
 @pytest.fixture
@@ -232,3 +233,158 @@ def test_to_timestamp_of_an_expression(cur):
     assert cur.fetchone() == (dt.datetime(2024, 5, 6, 7, 8, 9),)
     cur.execute("select to_timestamp_ntz(convert_timezone('UTC', current_timestamp())) is not null")
     assert cur.fetchone() == (True,)
+
+
+def test_show_columns(cur):
+    rows = cur.connection.cursor(DictCursor).execute("show columns in table orders").fetchall()
+    assert [(r["column_name"], r["null?"], r["kind"]) for r in rows] == [
+        ("ID", "false", "COLUMN"),
+        ("NOTE", "true", "COLUMN"),
+        ("AT", "true", "COLUMN"),
+    ]
+    assert [json.loads(r["data_type"]) for r in rows] == [
+        {"type": "FIXED", "precision": 38, "scale": 0, "nullable": False},
+        {
+            "type": "TEXT",
+            "length": 16777216,
+            "byteLength": 16777216,
+            "nullable": True,
+            "fixed": False,
+        },
+        {"type": "TIMESTAMP_NTZ", "precision": 0, "scale": 9, "nullable": True},
+    ]
+    assert (rows[1]["default"], rows[0]["table_name"], rows[0]["database_name"]) == (
+        "'n/a'",
+        "ORDERS",
+        "TESTDB",
+    )
+    # Without a table: every column of the current schema, views included.
+    cur.execute("show columns")
+    assert [(row[0], row[2]) for row in cur] == [
+        ("OPEN_ORDERS", "ID"),
+        ("ORDERS", "ID"),
+        ("ORDERS", "NOTE"),
+        ("ORDERS", "AT"),
+    ]
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("show columns in table missing")
+    assert failure.value.errno == 2003
+
+
+def test_show_parameters(cur):
+    cur.execute("alter session set timezone = 'Europe/Rome', query_tag = 'nightly'")
+    rows = cur.connection.cursor(DictCursor).execute("show parameters like 'timez%'").fetchall()
+    assert [(r["key"], r["value"], r["default"], r["level"], r["type"]) for r in rows] == [
+        ("TIMEZONE", "Europe/Rome", "UTC", "SESSION", "STRING")
+    ]
+    shown = {row[0]: row[1:4] for row in cur.execute("show parameters in session")}
+    assert shown["AUTOCOMMIT"] == ("true", "true", "")
+    assert shown["QUERY_TAG"] == ("nightly", "", "SESSION")
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("show parameters in account")
+    assert failure.value.errno == 2
+
+
+def test_primary_keys_are_recorded_and_not_enforced(cur):
+    cur.execute(
+        "create table items (id int primary key, sku varchar unique, "
+        "order_id int references orders (id))"
+    )
+    cur.execute("insert into items values (1, 'a', 99), (1, 'a', 99)")  # no constraint fires
+    with pytest.raises(DatabaseError) as failure:
+        cur.execute("insert into items (sku) values ('b')")  # but a key column is NOT NULL
+    assert failure.value.errno == 100072
+
+    cur.execute(
+        "create table lines (order_id int, line int, "
+        "constraint lines_pk primary key (order_id, line))"
+    )
+    keys = cur.connection.cursor(DictCursor).execute("show primary keys in table lines").fetchall()
+    assert [(k["column_name"], k["key_sequence"], k["constraint_name"]) for k in keys] == [
+        ("ORDER_ID", 1, "LINES_PK"),
+        ("LINE", 2, "LINES_PK"),
+    ]
+    assert len(cur.execute("show primary keys").fetchall()) == 3
+    described = {row[0]: (row[3], row[5]) for row in cur.execute("describe table items")}
+    assert described == {"ID": ("N", "Y"), "SKU": ("Y", "N"), "ORDER_ID": ("Y", "N")}
+
+
+def test_alter_table_primary_key(cur):
+    def key() -> list[tuple[str, str]]:
+        cur.execute("show primary keys in table orders")
+        return [(row[4], row[6]) for row in cur]
+
+    cur.execute("alter table orders add constraint orders_pk primary key (id)")
+    assert key() == [("ID", "ORDERS_PK")]
+    cur.execute("alter table orders rename column id to order_id")
+    cur.execute("alter table orders rename to purchases_2")
+    cur.execute("alter table purchases_2 rename to orders")
+    assert key() == [("ORDER_ID", "ORDERS_PK")]
+    cur.execute("alter table orders drop constraint other_name")  # not the key: no effect
+    assert key() == [("ORDER_ID", "ORDERS_PK")]
+    cur.execute("alter table orders drop primary key")
+    assert key() == []
+    cur.execute("alter table orders add primary key (order_id)")
+    cur.execute("alter table orders add constraint u unique (note)")
+    assert [column for column, _ in key()] == ["ORDER_ID"]
+    cur.execute("drop table orders")
+    cur.execute("create table orders (id int)")
+    assert key() == []  # a new table of the same name starts without the old key
+
+
+def test_swap_with(cur):
+    cur.execute("insert into orders (id) values (1)")
+    cur.execute("comment on table orders is 'live'")
+    cur.execute("create table orders_next (id int primary key, extra varchar)")
+    cur.execute("insert into orders_next values (2, 'x'), (3, 'y')")
+    cur.execute("alter table orders swap with orders_next")
+    assert cur.execute("select id from orders order by id").fetchall() == [(2,), (3,)]
+    assert cur.execute("select id from orders_next").fetchall() == [(1,)]
+    assert [row[0] for row in cur.execute("describe table orders")] == ["ID", "EXTRA"]
+    assert [row[3] for row in cur.execute("show primary keys")] == ["ORDERS"]
+    comments = {row[1]: row[5] for row in cur.execute("show tables")}
+    assert comments == {"ORDERS": "", "ORDERS_NEXT": "live"}
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("alter table orders swap with missing")
+    assert failure.value.errno == 2003
+
+
+def test_rename_into_another_schema(cur):
+    cur.execute("create schema archive")
+    cur.execute("use schema public")
+    cur.execute("insert into orders (id) values (1), (2)")
+    cur.execute("comment on table orders is 'All orders'")
+    cur.execute("comment on column orders.id is 'The key'")
+    cur.execute("alter table orders add primary key (id)")
+    cur.execute("alter table orders rename to archive.orders_2023")
+
+    assert names(cur, "show tables in schema testdb.archive") == ["ORDERS_2023"]
+    assert names(cur, "show tables in schema testdb.public") == []
+    cur.execute("select id, note from archive.orders_2023 order by id")
+    assert cur.fetchall() == [(1, "n/a"), (2, "n/a")]  # rows and the column default moved
+    row = cur.connection.cursor(DictCursor).execute("describe table archive.orders_2023").fetchone()
+    assert (row["name"], row["null?"], row["primary key"], row["comment"]) == (
+        "ID",
+        "N",
+        "Y",
+        "The key",
+    )
+    cur.execute("show tables in schema testdb.archive")
+    assert cur.fetchone()[5] == "All orders"
+
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("alter table archive.orders_2023 rename to nowhere.orders")
+    assert failure.value.errno == 2003
+    cur.execute("create database other")
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("alter table testdb.archive.orders_2023 rename to other.public.orders")
+    assert failure.value.errno == 2
+
+
+def test_a_view_keeps_reading_its_tables_after_moving(cur):
+    cur.execute("create schema reporting")
+    cur.execute("use schema public")
+    cur.execute("insert into orders (id) values (7)")
+    cur.execute("alter view open_orders rename to reporting.open_orders")
+    cur.execute("create table reporting.orders (id int)")  # must not capture the view
+    assert cur.execute("select * from reporting.open_orders").fetchall() == [(7,)]

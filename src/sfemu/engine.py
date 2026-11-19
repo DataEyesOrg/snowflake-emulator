@@ -30,6 +30,10 @@ class Engine:
         self._catalog_lock = threading.Lock()
         # DuckDB keeps no creation times; every object is reported as created now.
         self.started = dt.datetime.now(dt.UTC).replace(microsecond=0)
+        # Primary keys by (database, schema, table): the constraint's name and
+        # columns. Snowflake records them without enforcing them, so they are
+        # kept here and never reach DuckDB, which would enforce them.
+        self.primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]] = {}
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         cursor = self._root.cursor()
