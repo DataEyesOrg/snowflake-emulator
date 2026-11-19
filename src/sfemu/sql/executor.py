@@ -8,6 +8,7 @@ DuckDB, so a statement never passes locally by accident.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import uuid
 import warnings
 from dataclasses import dataclass, field
@@ -43,6 +44,12 @@ ARROW = "arrow"
 JSON = "json"
 
 _SUCCESS = "Statement executed successfully."
+# DML statements with their statement type id and row-count columns.
+_DML: list[tuple[type[exp.Expression], int, list[str]]] = [
+    (exp.Insert, INSERT, ["number of rows inserted"]),
+    (exp.Update, UPDATE, ["number of rows updated", "number of multi-joined rows updated"]),
+    (exp.Delete, DELETE, ["number of rows deleted"]),
+]
 _RELATION_KINDS = {"TABLE": "Table", "VIEW": "View"}
 
 
@@ -64,10 +71,21 @@ class QueryResult:
     total: int | None = None
     arrow: bytes | None = None  # the inline first chunk, as an Arrow IPC stream
     chunks: list[ResultChunk] = field(default_factory=list)
+    bind_count: int = 0
+    # Whether a driver may send this statement once with a column of values per
+    # bind; drivers ask with a describe-only request before executemany().
+    array_bind_supported: bool = False
 
     def __post_init__(self) -> None:
         if self.total is None:
             self.total = len(self.rows)
+
+
+def _dml_shape(statement: exp.Expression) -> tuple[int, list[str]] | None:
+    for kind, type_id, names in _DML:
+        if isinstance(statement, kind):
+            return type_id, names
+    return None
 
 
 def _status(message: str, statement_type_id: int) -> QueryResult:
@@ -79,8 +97,14 @@ class Executor:
         self._engine = engine
 
     def execute(
-        self, session: Session, sql: str, bindings: dict[str, Any] | None = None
+        self,
+        session: Session,
+        sql: str,
+        bindings: dict[str, Any] | None = None,
+        *,
+        describe_only: bool = False,
     ) -> QueryResult:
+        """Run one statement, or with describe_only just report its result columns."""
         statements = translate.parse(sql)
         if not statements:
             raise SnowflakeError("000900", "42601", "SQL compilation error:\nEmpty SQL statement.")
@@ -91,23 +115,79 @@ class Executor:
                 f"Actual statement count {len(statements)} "
                 "did not match the desired statement count 1.",
             )
-        params = _bind_values(bindings)
+        statement = statements[0]
+        binds = translate.bind_count(statement)
+        rows = _bind_rows(bindings)
         with session.lock:
             try:
-                return self._dispatch(session, statements[0], params)
+                if describe_only:
+                    result = self._describe(session, statement, binds)
+                elif rows is None:
+                    result = self._dispatch(session, statement, _bind_values(bindings))
+                else:
+                    result = self._dispatch_rows(session, statement, rows)
             except duckdb.Error as exc:
                 raise errors.from_duckdb(exc) from exc
+        result.bind_count = binds
+        result.array_bind_supported = isinstance(statement, exp.Insert)
+        return result
+
+    def _describe(self, session: Session, statement: exp.Expression, binds: int) -> QueryResult:
+        """The columns a statement would return, without running it."""
+        if isinstance(statement, exp.Query):
+            # Zero rows of the query give DuckDB's column types; the binds have
+            # no values yet, so they are described as NULLs.
+            translate.name_projections(statement)
+            probe = exp.select("*").from_(statement.subquery("_describe")).limit(0)
+            self._run(session, probe, [None] * binds)
+            description = session.cursor.description
+            columns = [column_from_duckdb(d[0], d[1]) for d in description]
+            return QueryResult(columns, [], SELECT, total=0)
+        dml = _dml_shape(statement)
+        if dml is not None:
+            type_id, names = dml
+            self._check(session, statement)
+            columns = [fixed_column(name, nullable=False) for name in names]
+            return QueryResult(columns, [], type_id, total=0)
+        return QueryResult([text_column("status", nullable=False)], [], DDL, total=0)
+
+    def _dispatch_rows(
+        self, session: Session, statement: exp.Expression, rows: list[list]
+    ) -> QueryResult:
+        """An array bind: run a DML statement once per row of bind values."""
+        dml = _dml_shape(statement)
+        if dml is None:
+            raise errors.unsupported(f"array bind for {_describe(statement)}")
+        type_id, names = dml
+        self._check(session, statement)
+        sql = translate.to_duckdb(statement)
+        cursor = session.cursor
+        # All rows or none: use a transaction of our own unless one is open.
+        try:
+            cursor.execute("BEGIN")
+            own_transaction = True
+        except duckdb.TransactionException:
+            own_transaction = False
+        affected = 0
+        try:
+            for row in rows:
+                affected += cursor.execute(sql, row).fetchone()[0]
+        except Exception:
+            if own_transaction:
+                cursor.execute("ROLLBACK")
+            raise
+        if own_transaction:
+            cursor.execute("COMMIT")
+        counts = [str(affected)] + ["0"] * (len(names) - 1)
+        columns = [fixed_column(name, nullable=False) for name in names]
+        return QueryResult(columns, [counts], type_id)
 
     def _dispatch(self, session: Session, statement: exp.Expression, params: list) -> QueryResult:
         if isinstance(statement, exp.Query):
             return self._query(session, statement, params)
-        if isinstance(statement, exp.Insert):
-            return self._dml(session, statement, params, INSERT, ["number of rows inserted"])
-        if isinstance(statement, exp.Update):
-            names = ["number of rows updated", "number of multi-joined rows updated"]
-            return self._dml(session, statement, params, UPDATE, names)
-        if isinstance(statement, exp.Delete):
-            return self._dml(session, statement, params, DELETE, ["number of rows deleted"])
+        dml = _dml_shape(statement)
+        if dml is not None:
+            return self._dml(session, statement, params, *dml)
         if isinstance(statement, exp.Create):
             return self._create(session, statement, params)
         if isinstance(statement, exp.Drop):
@@ -125,10 +205,32 @@ class Executor:
 
     # Queries and DML -------------------------------------------------------
 
-    def _run(self, session: Session, statement: exp.Expression, params: list) -> None:
-        self._require_namespace(session, statement)
-        _resolve_context_functions(session, statement)
+    def _run(
+        self,
+        session: Session,
+        statement: exp.Expression,
+        params: list,
+        creating: exp.Table | None = None,
+    ) -> None:
+        self._check(session, statement, creating)
         session.cursor.execute(translate.to_duckdb(statement), params)
+
+    def _check(
+        self, session: Session, statement: exp.Expression, creating: exp.Table | None = None
+    ) -> None:
+        """Everything that must hold before a statement may reach DuckDB."""
+        self._require_namespace(session, statement)
+        translate.check_supported(statement)
+        _resolve_context_functions(session, statement)
+        for table in translate.relations(statement):
+            if table is creating:
+                continue
+            database, schema, name = _qualify(session, table)
+            unqualified = not table.db
+            if not self._engine.relation_visible(
+                session.cursor, database, schema, name, temporary=unqualified
+            ):
+                raise errors.object_not_found(f"Object '{name}' does not exist or not authorized.")
 
     def _query(self, session: Session, statement: exp.Expression, params: list) -> QueryResult:
         translate.name_projections(statement)
@@ -228,7 +330,7 @@ class Executor:
                 return _status(f"{name} already exists, statement succeeded.", DDL)
             if exists and not replace:
                 raise _already_exists(name)
-            self._run(session, statement, params)
+            self._run(session, statement, params, creating=target)
             return _status(f"{_RELATION_KINDS[kind]} {name} successfully created.", DDL)
 
         raise errors.unsupported(f"CREATE {kind}")
@@ -389,6 +491,34 @@ def _literal_value(node: exp.Expression) -> Any:
     return node.name
 
 
+def _bind_rows(bindings: Any) -> list[list] | None:
+    """The rows of an array bind, or None when the binds are plain scalars.
+
+    An array bind carries a list of values per bind, one entry per row.
+    """
+    if not isinstance(bindings, dict) or not any(
+        isinstance(b, dict) and isinstance(b.get("value"), list) for b in bindings.values()
+    ):
+        return None
+    columns = []
+    for position in _bind_positions(bindings):
+        binding = bindings[position]
+        if not isinstance(binding, dict) or not isinstance(binding.get("value"), list):
+            raise errors.bad_request("array binds must be arrays for every bind")
+        kind = str(binding.get("type", "ANY")).upper()
+        columns.append([_bind_value(kind, value) for value in binding["value"]])
+    if len({len(column) for column in columns}) != 1:
+        raise errors.bad_request("array binds must all have the same length")
+    return [list(row) for row in zip(*columns, strict=True)]
+
+
+def _bind_positions(bindings: dict[str, Any]) -> list[str]:
+    try:
+        return sorted(bindings, key=int)
+    except ValueError as exc:
+        raise errors.bad_request("binding positions must be numbers") from exc
+
+
 def _bind_values(bindings: dict[str, Any] | None) -> list:
     """Turn the driver's positional (qmark) bindings into DuckDB parameters."""
     if not bindings:
@@ -396,32 +526,44 @@ def _bind_values(bindings: dict[str, Any] | None) -> list:
     if not isinstance(bindings, dict):
         raise errors.bad_request("bindings must be an object")
     values = []
-    try:
-        positions = sorted(bindings, key=int)
-    except ValueError as exc:
-        raise errors.bad_request("binding positions must be numbers") from exc
-    for position in positions:
+    for position in _bind_positions(bindings):
         binding = bindings[position]
         if not isinstance(binding, dict):
             raise errors.bad_request(f"binding {position} must be an object")
-        kind, value = str(binding.get("type", "ANY")).upper(), binding.get("value")
-        if value is None:
-            values.append(None)
-        elif isinstance(value, list):
-            raise errors.unsupported("array bind")
-        elif kind in ("FIXED", "REAL", "BOOLEAN"):
-            try:
-                values.append(_bind_scalar(kind, str(value)))
-            except (ValueError, ArithmeticError) as exc:
-                what = "Boolean" if kind == "BOOLEAN" else "Numeric"
-                raise SnowflakeError(
-                    "100038", "22018", f"{what} value '{value}' is not recognized"
-                ) from exc
-        elif kind in ("TEXT", "ANY"):
-            values.append(value)
-        else:
-            raise errors.unsupported(f"bind type {kind}")
+        kind = str(binding.get("type", "ANY")).upper()
+        values.append(_bind_value(kind, binding.get("value")))
     return values
+
+
+_EPOCH = dt.datetime(1970, 1, 1)
+_NOT_RECOGNIZED = {
+    "BOOLEAN": "Boolean",
+    "DATE": "Date",
+    "TIME": "Time",
+    "BINARY": "Binary",
+    "TIMESTAMP_NTZ": "Timestamp",
+    "TIMESTAMP_LTZ": "Timestamp",
+    "TIMESTAMP_TZ": "Timestamp",
+}
+
+
+def _bind_value(kind: str, value: Any) -> Any:
+    """One bind value, sent as a string in Snowflake's wire encoding, as a Python value."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        raise errors.bad_request("a bind value cannot be a nested array")
+    if kind in ("TEXT", "ANY"):
+        return value
+    if kind not in ("FIXED", "REAL", *_NOT_RECOGNIZED):
+        raise errors.unsupported(f"bind type {kind}")
+    try:
+        return _bind_scalar(kind, str(value))
+    except (ValueError, ArithmeticError) as exc:
+        what = _NOT_RECOGNIZED.get(kind, "Numeric")
+        raise SnowflakeError(
+            "100038", "22018", f"{what} value '{value}' is not recognized"
+        ) from exc
 
 
 def _bind_scalar(kind: str, value: str) -> Any:
@@ -429,9 +571,26 @@ def _bind_scalar(kind: str, value: str) -> Any:
         return int(value) if value.lstrip("-").isdigit() else Decimal(value)
     if kind == "REAL":
         return float(value)
-    if value.lower() not in ("true", "false"):
-        raise ValueError(value)
-    return value.lower() == "true"
+    if kind == "BOOLEAN":
+        if value.lower() not in ("true", "false"):
+            raise ValueError(value)
+        return value.lower() == "true"
+    if kind == "BINARY":
+        return bytes.fromhex(value)
+    if kind == "DATE":  # milliseconds since the epoch
+        return (_EPOCH + dt.timedelta(milliseconds=int(value))).date()
+    if kind == "TIME":  # nanoseconds since midnight
+        return (_EPOCH + dt.timedelta(microseconds=int(value) // 1000)).time()
+    # Timestamps: nanoseconds since the epoch, in UTC. TIMESTAMP_TZ may add
+    # the zone as " <offset in minutes + 1440>".
+    nanos, _, zone = value.partition(" ")
+    moment = _EPOCH + dt.timedelta(microseconds=int(nanos) // 1000)
+    if kind == "TIMESTAMP_NTZ":
+        return moment
+    moment = moment.replace(tzinfo=dt.UTC)
+    if zone:
+        moment = moment.astimezone(dt.timezone(dt.timedelta(minutes=int(zone) - 1440)))
+    return moment
 
 
 def _already_exists(name: str) -> SnowflakeError:

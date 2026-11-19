@@ -31,9 +31,67 @@ def parse(sql: str) -> list[exp.Expression]:
     return [normalize_identifiers(s, dialect=SNOWFLAKE) for s in statements]
 
 
+# Snowflake's INT, BIGINT, SMALLINT, TINYINT and BYTEINT are all synonyms of
+# NUMBER(38, 0); in DuckDB they would be 32-, 64-, 16- and 8-bit integers.
+_INTEGER_TYPES = {
+    exp.DataType.Type.INT,
+    exp.DataType.Type.BIGINT,
+    exp.DataType.Type.SMALLINT,
+    exp.DataType.Type.TINYINT,
+    exp.DataType.Type.MEDIUMINT,
+}
+
+
 def to_duckdb(statement: exp.Expression) -> str:
+    statement = statement.copy()  # keep Snowflake's types in the caller's tree
+    for data_type in list(statement.find_all(exp.DataType)):
+        if data_type.this in _INTEGER_TYPES:
+            data_type.replace(exp.DataType.build("DECIMAL(38, 0)"))
     # Every identifier is quoted so DuckDB stores the case Snowflake would.
     return statement.sql(dialect=DUCKDB, identify=True)
+
+
+def bind_count(statement: exp.Expression) -> int:
+    return sum(1 for _ in statement.find_all(exp.Placeholder))
+
+
+def relations(statement: exp.Expression) -> list[exp.Table]:
+    """The tables and views a statement refers to by name, CTE references excluded."""
+    cte_names = {cte.alias for cte in statement.find_all(exp.CTE)}
+    return [
+        table
+        for table in statement.find_all(exp.Table)
+        if isinstance(table.this, exp.Identifier) and (table.db or table.name not in cte_names)
+    ]
+
+
+def check_supported(statement: exp.Expression) -> None:
+    """Reject what would run on DuckDB but is not Snowflake.
+
+    The statement types are filtered by the executor; this covers what hides
+    inside an accepted statement.
+    """
+    for node in statement.walk():
+        if isinstance(node, exp.Anonymous):
+            # A function sqlglot has no Snowflake model for goes to DuckDB by
+            # name: at best a DuckDB function (list_value), at worst a
+            # same-named one with other semantics (hash).
+            raise errors.unsupported(f"function {node.name.upper()}")
+        if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
+            raise errors.unsupported(f"table function {_callable_name(node.this)}")
+        if isinstance(node, exp.Unnest | exp.ReadCSV):
+            raise errors.unsupported(f"table function {_callable_name(node)}")
+        if isinstance(node, exp.Table) and node.db.upper() == "INFORMATION_SCHEMA":
+            # DuckDB has an information_schema of its own, shaped differently.
+            raise errors.unsupported("INFORMATION_SCHEMA")
+
+
+def _callable_name(node: exp.Expression) -> str:
+    if isinstance(node, exp.Anonymous):
+        return node.name.upper()
+    if isinstance(node, exp.Func):
+        return node.sql_name()
+    return node.key.upper()
 
 
 def name_projections(statement: exp.Expression) -> None:
@@ -56,13 +114,8 @@ def name_projections(statement: exp.Expression) -> None:
 
 def unqualified_relations(statement: exp.Expression) -> tuple[bool, bool]:
     """Whether any relation relies on the current (database, schema) to resolve."""
-    cte_names = {cte.alias for cte in statement.find_all(exp.CTE)}
     needs_database = needs_schema = False
-    for table in statement.find_all(exp.Table):
-        if not isinstance(table.this, exp.Identifier):
-            continue  # table functions, VALUES and the like
-        if not table.db and table.name in cte_names:
-            continue
+    for table in relations(statement):
         needs_database = needs_database or not table.catalog
         needs_schema = needs_schema or not table.db
     return needs_database, needs_schema

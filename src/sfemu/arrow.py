@@ -72,9 +72,17 @@ def _column(column: Column, data: pa.Array) -> pa.Array:
     """Re-encode one DuckDB Arrow column the way Snowflake encodes it."""
     kind = column.type
     if kind == "fixed":
-        if pa.types.is_decimal(data.type) or pa.types.is_integer(data.type):
-            return data  # int8-64 and decimal128 are both understood as-is
-        return data.cast(pa.int64())  # unsigned and anything exotic
+        if pa.types.is_signed_integer(data.type):
+            return data
+        if pa.types.is_decimal(data.type) and data.type.scale > 0:
+            return data  # decimal128 is understood as-is
+        # NUMBER(p, 0), which every Snowflake integer type is: like Snowflake,
+        # send an int64 while the values fit, so pandas gets an integer column
+        # and not Decimal objects, and a decimal128 only when they do not.
+        try:
+            return data.cast(pa.int64())
+        except pa.ArrowInvalid:
+            return data.cast(pa.decimal128(38, 0))
     if kind == "real":
         return data.cast(pa.float64())
     if kind in ("text", "variant", "array", "object"):

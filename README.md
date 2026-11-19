@@ -75,7 +75,7 @@ and with Snowflake CLI 3.34:
 | DML | `INSERT`, `UPDATE`, `DELETE`, with Snowflake's row-count result sets |
 | DDL | `CREATE` / `DROP` for databases, schemas, tables, views; `TRUNCATE` |
 | Session | `USE`, `ALTER SESSION`, login session parameters, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
-| Binding | client-side (pyformat) and positional `?` for numbers, text, booleans |
+| Binding | client-side (pyformat) and positional `?` for numbers, text, booleans, dates, times, timestamps and binary; `executemany` as an array bind |
 | Results | Arrow for `fetch_pandas_all` / `get_result_batches`; large results in downloadable chunks |
 | Errors | Snowflake error codes and SQLSTATEs for the common failures |
 
@@ -85,7 +85,14 @@ no driver has exercised them yet.
 Statements outside this list are rejected with Snowflake's
 `000002 (0A000): Unsupported feature` instead of being passed to DuckDB. A
 statement that passes here by accident and fails on Snowflake is worse than
-one that fails here honestly.
+one that fails here honestly. The same goes for what hides inside an accepted
+statement: functions the emulator has no Snowflake model for, DuckDB's table
+functions (`read_csv`, `range`, `unnest`, ...) and `INFORMATION_SCHEMA`, which
+is not implemented yet. Table and view names are case-sensitive, as on
+Snowflake.
+
+SQL has no access to the server's files or network: DuckDB runs with external
+access switched off.
 
 Results follow the format the driver negotiated at login: a driver asking for
 Arrow (`PYTHON_CONNECTOR_QUERY_RESULT_FORMAT=arrow`, the Python connector's
@@ -97,8 +104,12 @@ they do on Snowflake.
 
 - The session time zone defaults to `UTC`, not `America/Los_Angeles`.
 - `TIMESTAMP_TZ` values lose their offset and come back as `TIMESTAMP_LTZ`.
-- Integer columns are DuckDB integers, not `NUMBER(38, 0)`, so they can
-  overflow where Snowflake would not.
+- Integer types are `NUMBER(38, 0)`, but an integer literal is still a DuckDB
+  integer, so arithmetic on literals alone can overflow (`2147483647 + 1`).
+- Column names are matched case-insensitively (`"id"` finds `ID`); table and
+  view names are not.
+- A function that sqlglot models but Snowflake does not have (a handful of
+  DuckDB and other dialects' functions) is not rejected.
 - An unaliased expression is named after sqlglot's rendering of it
   (`1 + 1`), which can differ in spacing from the text as typed (`1+1`).
 - Error messages for cases not yet mapped carry DuckDB's wording.

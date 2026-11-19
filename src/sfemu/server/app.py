@@ -110,7 +110,13 @@ def create_app(*, auto_create: bool = True) -> Starlette:
         body = await _body(request)
         sql = body.get("sqlText") or ""
         log.debug("query session=%s sql=%s", session.id, sql)
-        result = await run_in_threadpool(executor.execute, session, sql, body.get("bindings"))
+        result = await run_in_threadpool(
+            executor.execute,
+            session,
+            sql,
+            body.get("bindings"),
+            describe_only=bool(body.get("describeOnly")),
+        )
         if result.chunks:
             results.add(result.query_id, result.chunks)
         return _ok(_query_data(request, session, result))
@@ -261,8 +267,8 @@ def _query_data(request: Request, session: Session, result: QueryResult) -> dict
         "finalSchemaName": session.schema,
         "finalWarehouseName": session.warehouse,
         "finalRoleName": session.role,
-        "numberOfBinds": 0,
-        "arrayBindSupported": False,
+        "numberOfBinds": result.bind_count,
+        "arrayBindSupported": result.array_bind_supported,
         "statementTypeId": result.statement_type_id,
         "version": 1,
         "sendResultTime": int(time.time() * 1000),

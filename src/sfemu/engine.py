@@ -22,7 +22,10 @@ def quote(identifier: str) -> str:
 
 class Engine:
     def __init__(self) -> None:
-        self._root = duckdb.connect(":memory:")
+        # SQL sent by a client must never reach the server's files or network:
+        # this turns off read_csv, COPY, ATTACH of a file, extension installs.
+        # It cannot be switched back on while the database is running.
+        self._root = duckdb.connect(":memory:", config={"enable_external_access": False})
         self._catalog_lock = threading.Lock()
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
@@ -58,6 +61,45 @@ class Engine:
             f"SELECT 1 FROM {source} WHERE database_name = ? AND schema_name = ? AND {column} = ?",
             [database, schema, name],
         )
+
+    @staticmethod
+    def relation_visible(
+        cursor: duckdb.DuckDBPyConnection,
+        database: str | None,
+        schema: str | None,
+        name: str,
+        *,
+        temporary: bool,
+    ) -> bool:
+        """Whether a table or view with exactly this name exists, as seen by a session.
+
+        DuckDB resolves identifiers case-insensitively and Snowflake does not,
+        so a reference is checked here before DuckDB gets to resolve it. The
+        lookup runs on the session's own cursor, which also sees its temporary
+        tables and whatever its open transaction has created.
+        """
+        found = False
+        if database is not None and schema is not None and database not in _INTERNAL_DATABASES:
+            found = (
+                cursor.execute(
+                    "SELECT 1 FROM duckdb_tables() "
+                    "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+                    "UNION ALL SELECT 1 FROM duckdb_views() "
+                    "WHERE database_name = ? AND schema_name = ? AND view_name = ?",
+                    [database, schema, name] * 2,
+                ).fetchone()
+                is not None
+            )
+        if not found and temporary:
+            found = (
+                cursor.execute(
+                    "SELECT 1 FROM duckdb_tables() WHERE temporary AND table_name = ? "
+                    "UNION ALL SELECT 1 FROM duckdb_views() WHERE temporary AND view_name = ?",
+                    [name, name],
+                ).fetchone()
+                is not None
+            )
+        return found
 
     def create_database(self, name: str) -> None:
         with self._catalog_lock:

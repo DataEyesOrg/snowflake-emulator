@@ -224,3 +224,83 @@ def test_create_or_replace_schema(conn):
     with pytest.raises(ProgrammingError) as failure:
         cur.execute("create schema staging")
     assert failure.value.errno == 2002
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select list_value(1, 2)",  # a DuckDB function
+        "select hash(1)",  # exists on both sides, with different results
+        "select * from range(3)",
+        "select * from unnest([1, 2])",
+        "select * from duckdb_tables()",
+        "select * from read_csv('/etc/hosts')",
+        "select * from read_text('/etc/hosts')",
+        "create table leak as select * from read_text('/etc/hosts')",
+        "select * from information_schema.tables",
+    ],
+)
+def test_duckdb_only_sql_is_rejected(conn, sql):
+    with pytest.raises(ProgrammingError) as failure:
+        conn.cursor().execute(sql)
+    assert (failure.value.errno, failure.value.sqlstate) == (2, "0A000")
+
+
+def test_generator_is_supported(conn):
+    cur = conn.cursor()
+    cur.execute("select count(*) from table(generator(rowcount => 5))")
+    assert cur.fetchone() == (5,)
+
+
+def test_relation_names_are_case_sensitive(conn):
+    cur = conn.cursor()
+    cur.execute('create table "MiXed" (id int)')
+    cur.execute("create table plain (id int)")
+    assert cur.execute('select * from "MiXed"').fetchall() == []
+    assert cur.execute("select * from PLAIN").fetchall() == []
+    assert cur.execute("select * from testdb.public.plain").fetchall() == []
+    for sql in (
+        "select * from mixed",
+        "insert into mixed values (1)",
+        'select * from "plain"',
+        'select * from testdb."public".plain',
+        'select * from "system"."main"."duckdb_tables"',
+    ):
+        with pytest.raises(ProgrammingError) as failure:
+            cur.execute(sql)
+        assert failure.value.errno == 2003, sql
+
+
+def test_cte_and_temporary_names_resolve(conn):
+    cur = conn.cursor()
+    cur.execute("create table t (id int)")
+    assert cur.execute("with t as (select 1 a) select * from t").fetchall() == [(1,)]
+    cur.execute("create temporary table scratch (id int)")
+    cur.execute("insert into scratch values (1)")
+    assert cur.execute("select * from scratch").fetchall() == [(1,)]
+
+
+def test_a_transaction_sees_the_tables_it_created(conn):
+    cur = conn.cursor()
+    cur.execute("begin")
+    cur.execute("create table fresh (id int)")
+    cur.execute("insert into fresh values (1)")
+    assert cur.execute("select * from fresh").fetchall() == [(1,)]
+    cur.execute("rollback")
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("select * from fresh")
+    assert failure.value.errno == 2003
+
+
+@pytest.mark.parametrize("name", ["int", "integer", "bigint", "smallint", "tinyint", "byteint"])
+def test_integer_types_are_number_38_0(conn, name):
+    # In Snowflake these are all synonyms of NUMBER(38, 0), not machine integers.
+    cur = conn.cursor()
+    huge = 10**37 + 1
+    cur.execute(f"create table n (id {name})")
+    cur.execute(f"insert into n values (3000000000), ({huge})")
+    cur.execute("select id, id + 1 from n order by id")
+    assert cur.fetchall() == [(3000000000, 3000000001), (huge, huge + 1)]
+    column = cur.description[0]
+    assert (column.precision, column.scale) == (38, 0)
+    assert cur.execute(f"select 3000000000::{name}").fetchone() == (3000000000,)

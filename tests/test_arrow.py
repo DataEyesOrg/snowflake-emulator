@@ -99,16 +99,33 @@ def test_empty_arrow_result_in_pandas_and_batches(arrow_conn):
 
 def test_fetch_pandas_all(arrow_conn):
     cur = arrow_conn.cursor()
-    cur.execute("create table events as select range id, 'e' || range name from range(1000)")
+    cur.execute(
+        "create table events as select seq4() id, 'e' || seq4() name "
+        "from table(generator(rowcount => 1000))"
+    )
     frame = cur.execute("select * from events order by id").fetch_pandas_all()
     assert len(frame) == 1000
     assert frame["ID"].sum() == 499_500
     assert frame["NAME"][999] == "e999"
 
 
+def test_integer_columns_are_integers_in_pandas(arrow_conn):
+    # Integer types are NUMBER(38, 0); values that fit must still reach pandas
+    # as int64 and not as Decimal objects.
+    cur = arrow_conn.cursor()
+    cur.execute("create table n (id int, big bigint)")
+    cur.execute("insert into n values (1, 3000000000), (2, 4000000000)")
+    frame = cur.execute("select * from n order by id").fetch_pandas_all()
+    assert [str(dtype) for dtype in frame.dtypes] == ["int64", "int64"]
+    assert frame["BIG"].tolist() == [3000000000, 4000000000]
+
+    cur.execute("insert into n values (3, 99999999999999999999)")  # beyond int64
+    assert cur.execute("select big from n where id = 3").fetchone() == (99999999999999999999,)
+
+
 def test_large_arrow_results_arrive_in_chunks(chunked_conn):
     cur = chunked_conn.cursor()
-    cur.execute("create table t as select range id from range(5)")
+    cur.execute("create table t as select seq4() id from table(generator(rowcount => 5))")
 
     assert cur.execute("select * from t order by id").fetchall() == [(i,) for i in range(5)]
 
@@ -129,7 +146,10 @@ def test_large_json_results_arrive_in_chunks(server):
     )
     with snowflake.connector.connect(**parameters) as conn:
         cur = conn.cursor()
-        cur.execute("create table t as select range id, 'x' || range s from range(10)")
+        cur.execute(
+            "create table t as select seq4() id, 'x' || seq4() s "
+            "from table(generator(rowcount => 10))"
+        )
         assert cur.execute("select * from t order by id").fetchall() == [
             (i, f"x{i}") for i in range(10)
         ]

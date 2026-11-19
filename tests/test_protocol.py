@@ -92,3 +92,50 @@ def test_unexpected_failures_reach_the_driver_as_errors(server):
     reply = call(server, "/session/v1/login-request", {"data": [1, 2]})
     assert reply["success"] is False
     assert reply["code"] == "000603"
+
+
+def test_describe_only_reports_columns_without_running(server):
+    session = login(server)
+    token = session["token"]
+
+    def query(sql: str, **extra: Any) -> dict[str, Any]:
+        return call(server, "/queries/v1/query-request", {"sqlText": sql, **extra}, token=token)
+
+    assert query("create database d")["success"]
+    assert query("create table t (id int, name varchar)")["success"]
+
+    described = query("insert into t values (?, ?)", describeOnly=True)["data"]
+    assert described["numberOfBinds"] == 2
+    assert described["arrayBindSupported"] is True
+    assert [c["name"] for c in described["rowtype"]] == ["number of rows inserted"]
+    assert query("select count(*) from t")["data"]["rowset"] == [["0"]]
+
+    described = query("select id, name from t where id = ?", describeOnly=True)["data"]
+    assert [(c["name"], c["type"]) for c in described["rowtype"]] == [
+        ("ID", "fixed"),
+        ("NAME", "text"),
+    ]
+    assert described["rowset"] == []
+    assert described["arrayBindSupported"] is False
+
+
+def test_array_binds_run_the_statement_per_row(server):
+    session = login(server)
+    token = session["token"]
+    call(server, "/queries/v1/query-request", {"sqlText": "create database d"}, token=token)
+    create = {"sqlText": "create table t (id int, name varchar)"}
+    call(server, "/queries/v1/query-request", create, token=token)
+
+    insert = {
+        "sqlText": "insert into t values (?, ?)",
+        "bindings": {
+            "1": {"type": "FIXED", "value": ["1", "2", "3"]},
+            "2": {"type": "TEXT", "value": ["a", None, "c"]},
+        },
+    }
+    reply = call(server, "/queries/v1/query-request", insert, token=token)
+    assert reply["data"]["rowset"] == [["3"]]
+
+    insert["bindings"]["2"]["value"] = ["a"]  # columns of different lengths
+    reply = call(server, "/queries/v1/query-request", insert, token=token)
+    assert (reply["success"], reply["code"]) == (False, "390142")

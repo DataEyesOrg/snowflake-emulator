@@ -22,6 +22,9 @@ DEFAULT_PARAMETERS: dict[str, Any] = {
     "CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY": 3600,
     "CLIENT_RESULT_CHUNK_SIZE": 160,
     "CLIENT_PREFETCH_THREADS": 4,
+    # Drivers upload array binds this large to a stage instead of sending them
+    # inline; 0 turns that off, as there are no stages yet. (Snowflake: 65280.)
+    "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD": 0,
     "CLIENT_TELEMETRY_ENABLED": False,
     "QUERY_RESULT_FORMAT": "JSON",
     "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT": "JSON",
