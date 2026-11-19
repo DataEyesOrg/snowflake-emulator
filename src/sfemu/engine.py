@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+from dataclasses import dataclass, field
 
 import duckdb
 
@@ -17,8 +18,27 @@ DEFAULT_SCHEMA = "PUBLIC"
 INTERNAL_DATABASES = ("memory", "system", "temp")
 
 
+PRIMARY_KEY = "PRIMARY KEY"
+UNIQUE = "UNIQUE"
+FOREIGN_KEY = "FOREIGN KEY"
+
+TableKey = tuple[str, str, str]  # (database, schema, table)
+
+
 def quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+@dataclass
+class Constraint:
+    """A key constraint of a table: PRIMARY KEY, UNIQUE or FOREIGN KEY."""
+
+    kind: str
+    name: str
+    columns: list[str]
+    # A foreign key's target. Without columns it points at the target's primary key.
+    references: TableKey | None = None
+    referenced_columns: list[str] = field(default_factory=list)
 
 
 class Engine:
@@ -30,10 +50,47 @@ class Engine:
         self._catalog_lock = threading.Lock()
         # DuckDB keeps no creation times; every object is reported as created now.
         self.started = dt.datetime.now(dt.UTC).replace(microsecond=0)
-        # Primary keys by (database, schema, table): the constraint's name and
-        # columns. Snowflake records them without enforcing them, so they are
-        # kept here and never reach DuckDB, which would enforce them.
-        self.primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]] = {}
+        # Key constraints by table. Snowflake records them without enforcing
+        # them, so they are kept here and never reach DuckDB, which would
+        # enforce them.
+        self.constraints: dict[TableKey, list[Constraint]] = {}
+
+    def primary_key(self, table: TableKey) -> Constraint | None:
+        return next((c for c in self.constraints.get(table, []) if c.kind == PRIMARY_KEY), None)
+
+    def add_constraint(self, table: TableKey, constraint: Constraint) -> None:
+        kept = self.constraints.setdefault(table, [])
+        if constraint.kind == PRIMARY_KEY:  # a table has one; the new one replaces it
+            kept[:] = [c for c in kept if c.kind != PRIMARY_KEY]
+        kept.append(constraint)
+
+    def drop_constraints(self, table: TableKey, *, name: str | None = None) -> None:
+        """Forget the constraint of this name, or the primary key when no name is given."""
+        kept = self.constraints.get(table, [])
+        if name is None:
+            kept[:] = [c for c in kept if c.kind != PRIMARY_KEY]
+        else:
+            kept[:] = [c for c in kept if c.name != name]
+
+    def move_constraints(self, old: TableKey, new: TableKey) -> None:
+        """A table was renamed: its constraints follow, and so do foreign keys to it."""
+        moved = self.constraints.pop(old, None)
+        if moved:
+            self.constraints[new] = moved
+        for constraints in self.constraints.values():
+            for constraint in constraints:
+                if constraint.references == old:
+                    constraint.references = new
+
+    def rename_column(self, table: TableKey, old: str, new: str) -> None:
+        for key, constraints in self.constraints.items():
+            for constraint in constraints:
+                if key == table:
+                    constraint.columns = [new if c == old else c for c in constraint.columns]
+                if constraint.references == table:
+                    constraint.referenced_columns = [
+                        new if c == old else c for c in constraint.referenced_columns
+                    ]
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         cursor = self._root.cursor()

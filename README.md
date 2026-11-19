@@ -74,10 +74,10 @@ append) models.
 | Area | Supported |
 |---|---|
 | Protocol | login, query, logout; JSON and Arrow result formats; multi-statement requests (`num_statements`, `MULTI_STATEMENT_COUNT`); results and status of a recent query by its id |
-| Queries | `SELECT` and set operations, translated by sqlglot |
+| Queries | `SELECT` and set operations, translated by sqlglot; `RESULT_SCAN` and `LAST_QUERY_ID` over the results of recent statements |
 | DML | `INSERT`, `INSERT OVERWRITE`, `UPDATE`, `DELETE`, `MERGE`, with Snowflake's row-count result sets |
 | DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, also into another schema; `SWAP WITH`; add / drop / rename / retype column; primary keys; comments); `COMMENT ON` |
-| Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`), columns, primary keys, session parameters; `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
+| Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`), columns, primary, unique and imported keys, session parameters; `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
 | Access control | none: `GRANT` and `REVOKE` are accepted and ignored, `SHOW GRANTS` is empty |
 | Session | `USE`, `ALTER SESSION`, login session parameters, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
 | Binding | client-side (pyformat) and positional `?` for numbers, text, booleans, dates, times, timestamps and binary; `executemany` as an array bind |
@@ -120,13 +120,17 @@ they do on Snowflake.
 - `AUTOCOMMIT = FALSE` is accepted but not applied.
 - A statement that fails inside an explicit transaction aborts it: everything
   until `ROLLBACK` fails too. Snowflake would carry on with the transaction.
-- Primary keys are recorded and, as on Snowflake, not enforced. `UNIQUE` and
-  `FOREIGN KEY` constraints are accepted and not recorded.
+- Primary, unique and foreign keys are recorded and, as on Snowflake, not
+  enforced. A foreign key may name a table that does not exist; it is then
+  left out of `SHOW IMPORTED KEYS`. A key is dropped by constraint name or
+  with `DROP PRIMARY KEY`; `DROP UNIQUE (...)`, `DROP FOREIGN KEY (...)` and
+  `SHOW EXPORTED KEYS` are not supported.
 - A table or view can be renamed into another schema but not into another
   database. Moving it recreates it, so views that select from it must be
   recreated, as on Snowflake.
-- `RESULT_SCAN` is not supported, so connectors 3.x and 4.x cannot re-read a
-  result with `get_results_from_sfqid`; connector 5.x can.
+- `RESULT_SCAN` reads the results of the last 256 statements, from any
+  session; Snowflake keeps results for 24 hours and only shows them to the
+  user who ran the query. `LAST_QUERY_ID` does not count failed statements.
 - Temporary tables are dropped when their session ends, but until then other
   sessions can see them.
 - The catalog has no history: every object reports the emulator's start time

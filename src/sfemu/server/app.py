@@ -12,9 +12,7 @@ import gzip
 import json
 import logging
 import re
-import threading
 import time
-from collections import OrderedDict
 from typing import Any
 
 from starlette.applications import Starlette
@@ -27,7 +25,7 @@ from sfemu import __version__, errors
 from sfemu.engine import Engine
 from sfemu.errors import SnowflakeError
 from sfemu.session import Session, SessionManager
-from sfemu.sql.executor import Executor, QueryResult, ResultChunk
+from sfemu.sql.executor import Executor, QueryResult
 
 log = logging.getLogger("sfemu")
 
@@ -35,47 +33,13 @@ log = logging.getLogger("sfemu")
 SERVER_VERSION = "9.0.0"
 _TOKEN = re.compile(r'Snowflake Token="([^"]*)"')
 _HOUR = 3600
-# Results are dropped after this many queries; drivers fetch them right after
-# the query, so this only bounds memory.
-_KEPT_RESULTS = 256
-
-
-class ResultStore:
-    """Results of recent queries, by query id.
-
-    Drivers come back for them: for the chunks of a large result, for each
-    statement of a multi-statement request, or when asked for the result of
-    an earlier query. The oldest are dropped; Snowflake keeps them a day.
-    """
-
-    def __init__(self, capacity: int = _KEPT_RESULTS) -> None:
-        self._capacity = capacity
-        self._lock = threading.Lock()
-        self._results: OrderedDict[str, QueryResult] = OrderedDict()
-
-    def add(self, result: QueryResult) -> None:
-        with self._lock:
-            for kept in (result, *result.children):
-                self._results[kept.query_id] = kept
-            while len(self._results) > self._capacity:
-                self._results.popitem(last=False)
-
-    def get(self, query_id: str) -> QueryResult | None:
-        with self._lock:
-            return self._results.get(query_id)
-
-    def chunk(self, query_id: str, index: int) -> ResultChunk | None:
-        result = self.get(query_id)
-        if result is None or not 0 <= index < len(result.chunks):
-            return None
-        return result.chunks[index]
 
 
 def create_app(*, auto_create: bool = True) -> Starlette:
     engine = Engine()
     sessions = SessionManager(engine, auto_create=auto_create)
     executor = Executor(engine)
-    results = ResultStore()
+    results = executor.results
 
     def authenticate(request: Request) -> Session:
         session = sessions.get(_token(request))
@@ -127,7 +91,6 @@ def create_app(*, auto_create: bool = True) -> Starlette:
             describe_only=bool(body.get("describeOnly")),
             statement_count=_statement_count(body),
         )
-        results.add(result)
         return _ok(_query_data(request, session, result))
 
     async def query_result(request: Request) -> JSONResponse:

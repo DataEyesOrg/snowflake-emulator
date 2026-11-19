@@ -42,9 +42,13 @@ sqlglot, совместимый по протоколу с драйверами 
 - [x] `SHOW COLUMNS` / `PARAMETERS` / `PRIMARY KEYS`; первичные ключи
       запоминаются и не навязываются
 - [x] `ALTER TABLE ... SWAP WITH`, переименование в другую схему той же базы
+- [x] `RESULT_SCAN` и `LAST_QUERY_ID` (в том числе `get_results_from_sfqid`
+      на коннекторах 3.x / 4.x)
+- [x] `SHOW UNIQUE KEYS` / `IMPORTED KEYS`; уникальные и внешние ключи
+      запоминаются и не навязываются
 - [ ] один реальный dbt-проект — вторая половина критерия готовности
-- [ ] `RESULT_SCAN` (нужен коннекторам 3.x / 4.x для `get_results_from_sfqid`),
-      `SHOW UNIQUE KEYS` / `IMPORTED KEYS`, переименование в другую базу
+- [ ] переименование в другую базу; `SHOW EXPORTED KEYS`,
+      `DROP UNIQUE (...)` / `DROP FOREIGN KEY (...)`
 
 Фаза 0 пропущена и остаётся открытой: спайк на fakesnow и conformance-тесты
 против настоящего аккаунта ещё не сделаны.

@@ -9,6 +9,7 @@ dates from the moment the emulator started.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import re
 from typing import Any
@@ -18,7 +19,7 @@ import sqlglot
 from sqlglot import exp
 
 from sfemu import errors
-from sfemu.engine import INTERNAL_DATABASES
+from sfemu.engine import FOREIGN_KEY, INTERNAL_DATABASES, PRIMARY_KEY, UNIQUE, Constraint, TableKey
 from sfemu.types import Column, fixed_column, text_column
 
 OWNER = "SYSADMIN"
@@ -87,7 +88,7 @@ def show(
     database: str | None,
     schema: str | None,
     started: dt.datetime,
-    primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]],
+    constraints: dict[TableKey, list[Constraint]],
 ) -> Rows:
     """Answer a SHOW command for a session whose current namespace is given."""
     what = str(statement.name).upper()
@@ -100,11 +101,13 @@ def show(
     elif what in ("OBJECTS", "TABLES", "VIEWS"):
         scope = _scope(cursor, statement, database, schema, default="SCHEMA")
         columns, rows = _show_objects(cursor, what, terse, scope, started)
-    elif what in ("COLUMNS", "PRIMARY KEYS"):
+    elif what in ("COLUMNS", *_KEY_KINDS, "IMPORTED KEYS"):
         scope = _table_scope(cursor, statement, database, schema)
         if what == "COLUMNS":
             return _show_columns(cursor, scope)
-        return _show_primary_keys(cursor, scope, primary_keys, started)
+        if what == "IMPORTED KEYS":
+            return _show_imported_keys(cursor, scope, constraints, started)
+        return _show_keys(cursor, scope, constraints, started, _KEY_KINDS[what])
     else:
         raise errors.unsupported(f"SHOW {what}")
     return columns, _narrow(statement, columns, rows)
@@ -190,26 +193,78 @@ def _type_json(name: str, precision: int, scale: int, nullable: bool) -> str:
     return json.dumps(described, separators=(",", ":"))
 
 
-def _show_primary_keys(
+_KEY_KINDS = {"PRIMARY KEYS": PRIMARY_KEY, "UNIQUE KEYS": UNIQUE}
+
+
+def _constraints_in(
     cursor: duckdb.DuckDBPyConnection,
     scope: tuple[str | None, str | None, str | None],
-    primary_keys: dict[tuple[str, str, str], tuple[str, list[str]]],
-    started: dt.datetime,
-) -> Rows:
-    columns = _columns(
-        "created_on:ts database_name schema_name table_name column_name key_sequence:n "
-        "constraint_name rely comment"
-    )
+    constraints: dict[TableKey, list[Constraint]],
+    kind: str,
+) -> tuple[set[TableKey], list[tuple[TableKey, Constraint]]]:
+    """The existing tables, and the constraints of one kind on those in scope."""
     existing = {row[:3] for row in _select(cursor, _OBJECTS_SQL)}
-    rows = []
-    for key in sorted(primary_keys):
+    found = []
+    for key in sorted(constraints):
         if key not in existing or any(
             wanted is not None and wanted != part for wanted, part in zip(scope, key, strict=True)
         ):
             continue
-        constraint, key_columns = primary_keys[key]
-        for position, column in enumerate(key_columns, start=1):
-            rows.append([started, *key, column, position, constraint, "false", None])
+        found += [(key, constraint) for constraint in constraints[key] if constraint.kind == kind]
+    return existing, found
+
+
+def _show_keys(
+    cursor: duckdb.DuckDBPyConnection,
+    scope: tuple[str | None, str | None, str | None],
+    constraints: dict[TableKey, list[Constraint]],
+    started: dt.datetime,
+    kind: str,
+) -> Rows:
+    """SHOW PRIMARY KEYS and SHOW UNIQUE KEYS: one row per column of a key."""
+    columns = _columns(
+        "created_on:ts database_name schema_name table_name column_name key_sequence:n "
+        "constraint_name rely comment"
+    )
+    rows = []
+    for key, constraint in _constraints_in(cursor, scope, constraints, kind)[1]:
+        for position, column in enumerate(constraint.columns, start=1):
+            rows.append([started, *key, column, position, constraint.name, "false", None])
+    return columns, rows
+
+
+def _show_imported_keys(
+    cursor: duckdb.DuckDBPyConnection,
+    scope: tuple[str | None, str | None, str | None],
+    constraints: dict[TableKey, list[Constraint]],
+    started: dt.datetime,
+) -> Rows:
+    """SHOW IMPORTED KEYS: the foreign keys of the tables in scope, a row per column."""
+    columns = _columns(
+        "created_on:ts pk_database_name pk_schema_name pk_table_name pk_column_name "
+        "fk_database_name fk_schema_name fk_table_name fk_column_name key_sequence:n "
+        "update_rule delete_rule fk_name pk_name deferrability rely comment"
+    )
+    existing, found = _constraints_in(cursor, scope, constraints, FOREIGN_KEY)
+    rows = []
+    for key, constraint in found:
+        target = constraint.references
+        if target is None or target not in existing:
+            continue
+        keys = [c for c in constraints.get(target, []) if c.kind in (PRIMARY_KEY, UNIQUE)]
+        primary = next((c for c in keys if c.kind == PRIMARY_KEY), None)
+        # REFERENCES without columns means the target's primary key.
+        referenced = constraint.referenced_columns or (primary.columns if primary else [])
+        matched = next((c for c in keys if c.columns == referenced), None)
+        pairs = itertools.zip_longest(referenced, constraint.columns)
+        for position, (target_column, column) in enumerate(pairs, start=1):
+            if column is None:
+                break
+            rows.append(
+                [started, *target, target_column, *key, column, position, "NO ACTION",
+                 "NO ACTION", constraint.name, matched.name if matched else "",
+                 "NOT DEFERRABLE", "false", None]
+            )  # fmt: skip
     return columns, rows
 
 
@@ -428,9 +483,11 @@ def describe(
     database: str,
     schema: str,
     name: str,
-    primary_key: list[str],
+    constraints: list[Constraint],
 ) -> Rows:
     """DESCRIBE TABLE or VIEW; the relation is known to exist."""
+    primary_key = {c for k in constraints if k.kind == PRIMARY_KEY for c in k.columns}
+    unique = {c for k in constraints if k.kind == UNIQUE for c in k.columns}
     found = _select(
         cursor,
         _COLUMNS_SQL,
@@ -450,7 +507,7 @@ def describe(
             _yn(nullable),
             default,
             _yn(column_name in primary_key),
-            "N",
+            _yn(column_name in unique),
             None,
             None,
             comment,

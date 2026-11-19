@@ -305,8 +305,102 @@ def test_primary_keys_are_recorded_and_not_enforced(cur):
         ("LINE", 2, "LINES_PK"),
     ]
     assert len(cur.execute("show primary keys").fetchall()) == 3
-    described = {row[0]: (row[3], row[5]) for row in cur.execute("describe table items")}
-    assert described == {"ID": ("N", "Y"), "SKU": ("Y", "N"), "ORDER_ID": ("Y", "N")}
+    described = {row[0]: (row[3], row[5], row[6]) for row in cur.execute("describe table items")}
+    assert described == {
+        "ID": ("N", "Y", "N"),
+        "SKU": ("Y", "N", "Y"),
+        "ORDER_ID": ("Y", "N", "N"),
+    }
+
+
+def test_unique_keys(cur):
+    def unique_keys(sql: str = "show unique keys in table items") -> list[tuple]:
+        return [(row[3], row[4], row[5], row[6]) for row in cur.execute(sql)]
+
+    cur.execute(
+        "create table items (id int primary key, sku varchar constraint items_sku unique, "
+        "shelf int, slot int, constraint items_place unique (shelf, slot))"
+    )
+    assert unique_keys() == [
+        ("ITEMS", "SKU", 1, "ITEMS_SKU"),
+        ("ITEMS", "SHELF", 1, "ITEMS_PLACE"),
+        ("ITEMS", "SLOT", 2, "ITEMS_PLACE"),
+    ]
+    cur.execute("insert into items values (1, 'a', 1, 1), (2, 'a', 1, 1)")  # not enforced
+
+    cur.execute("alter table orders add constraint orders_note unique (note)")
+    cur.execute("alter table orders add column code varchar unique")
+    assert [row[:2] for row in unique_keys("show unique keys")] == [
+        ("ITEMS", "SKU"),
+        ("ITEMS", "SHELF"),
+        ("ITEMS", "SLOT"),
+        ("ORDERS", "NOTE"),
+        ("ORDERS", "CODE"),
+    ]
+    assert len(cur.execute("show primary keys").fetchall()) == 1  # the kinds stay apart
+
+    cur.execute("alter table items rename column slot to position")
+    cur.execute("alter table items drop constraint items_sku")
+    cur.execute("alter table items rename to stock")
+    assert unique_keys("show unique keys in table stock") == [
+        ("STOCK", "SHELF", 1, "ITEMS_PLACE"),
+        ("STOCK", "POSITION", 2, "ITEMS_PLACE"),
+    ]
+    cur.execute("create or replace table stock (id int)")
+    assert unique_keys("show unique keys in table stock") == []
+
+
+def test_imported_keys(cur):
+    def imported(sql: str) -> list[dict]:
+        return cur.connection.cursor(DictCursor).execute(sql).fetchall()
+
+    cur.execute("alter table orders add constraint orders_pk primary key (id)")
+    cur.execute("create table customers (region varchar, code int, unique (region, code))")
+    cur.execute(
+        "create table lines (id int, order_id int constraint lines_order references orders, "
+        "region varchar, code int, "
+        "constraint lines_customer foreign key (region, code) references customers (region, code))"
+    )
+    cur.execute("insert into lines values (1, 404, 'nowhere', 0)")  # not enforced
+
+    keys = imported("show imported keys in table lines")
+    assert [
+        (k["pk_table_name"], k["pk_column_name"], k["fk_column_name"], k["key_sequence"])
+        for k in keys
+    ] == [
+        ("ORDERS", "ID", "ORDER_ID", 1),  # REFERENCES without columns: the primary key
+        ("CUSTOMERS", "REGION", "REGION", 1),
+        ("CUSTOMERS", "CODE", "CODE", 2),
+    ]
+    first = keys[0]
+    assert (first["fk_name"], first["pk_name"]) == ("LINES_ORDER", "ORDERS_PK")
+    assert (first["pk_database_name"], first["pk_schema_name"]) == ("TESTDB", "PUBLIC")
+    assert (first["fk_database_name"], first["fk_schema_name"], first["fk_table_name"]) == (
+        "TESTDB",
+        "PUBLIC",
+        "LINES",
+    )
+    assert (first["update_rule"], first["delete_rule"]) == ("NO ACTION", "NO ACTION")
+    assert keys[1]["fk_name"] == keys[2]["fk_name"] == "LINES_CUSTOMER"
+    assert keys[1]["pk_name"].startswith("SYS_CONSTRAINT_")  # the unnamed UNIQUE
+
+    assert imported("show imported keys in table orders") == []
+    cur.execute("alter table orders add column customer_code int")
+    cur.execute("alter table orders add foreign key (customer_code) references customers (code)")
+    assert len(imported("show imported keys")) == 4
+    assert len(imported("show imported keys in schema testdb.public")) == 4
+
+    # Renames on either side are followed; a dropped table takes its keys along.
+    cur.execute("alter table customers rename to clients")
+    cur.execute("alter table clients rename column code to client_code")
+    cur.execute("alter table lines drop constraint lines_order")
+    keys = imported("show imported keys in table lines")
+    assert [(k["pk_table_name"], k["pk_column_name"], k["fk_column_name"]) for k in keys] == [
+        ("CLIENTS", "REGION", "REGION"),
+        ("CLIENTS", "CLIENT_CODE", "CODE"),
+    ]
+    cur.execute("drop table clients")
+    assert imported("show imported keys") == []
 
 
 def test_alter_table_primary_key(cur):
@@ -327,6 +421,11 @@ def test_alter_table_primary_key(cur):
     cur.execute("alter table orders add primary key (order_id)")
     cur.execute("alter table orders add constraint u unique (note)")
     assert [column for column, _ in key()] == ["ORDER_ID"]
+    cur.execute("alter table orders drop constraint orders_pk")  # the old name: no effect
+    assert len(key()) == 1
+    cur.execute("alter table orders add constraint named_pk primary key (order_id)")
+    cur.execute("alter table orders drop constraint named_pk")
+    assert key() == []
     cur.execute("drop table orders")
     cur.execute("create table orders (id int)")
     assert key() == []  # a new table of the same name starts without the old key

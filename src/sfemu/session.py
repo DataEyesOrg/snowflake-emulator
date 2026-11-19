@@ -59,6 +59,11 @@ class Session:
     # DuckDB's temporary tables live outside any schema, Snowflake's inside one.
     # They are therefore ordinary tables that the session drops when it closes.
     temporary_tables: set[tuple[str, str, str]] = field(default_factory=set)
+    # The ids of the statements this session ran, oldest first: LAST_QUERY_ID().
+    query_ids: list[str] = field(default_factory=list)
+    # DuckDB temporary tables holding the results a statement read through
+    # RESULT_SCAN; dropped before the session's next statement.
+    scratch: list[str] = field(default_factory=list)
 
     def use(self, database: str | None, schema: str | None) -> None:
         """Point both the session and its DuckDB cursor at a database and schema."""

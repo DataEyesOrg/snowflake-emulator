@@ -113,7 +113,10 @@ def check_supported(statement: exp.Expression) -> None:
     The statement types are filtered by the executor; this covers what hides
     inside an accepted statement.
     """
+    scans = {id(scan) for scan in result_scans(statement)}
     for node in statement.walk():
+        if id(node) in scans or id(node.parent) in scans and node is node.parent.this:
+            continue  # the executor answers RESULT_SCAN itself
         if isinstance(node, exp.Anonymous):
             # A function sqlglot has no Snowflake model for goes to DuckDB by
             # name: at best a DuckDB function (list_value), at worst a
@@ -123,6 +126,15 @@ def check_supported(statement: exp.Expression) -> None:
             raise errors.unsupported(f"table function {_callable_name(node.this)}")
         if isinstance(node, exp.Unnest | exp.ReadCSV):
             raise errors.unsupported(f"table function {_callable_name(node)}")
+
+
+def result_scans(statement: exp.Expression) -> list[exp.Expression]:
+    """The FROM items that are RESULT_SCAN(...), with or without TABLE( ) around."""
+    return [
+        node
+        for node in statement.find_all(exp.TableFromRows, exp.Table)
+        if isinstance(node.this, exp.Anonymous) and node.this.name.upper() == "RESULT_SCAN"
+    ]
 
 
 def _callable_name(node: exp.Expression) -> str:
