@@ -11,6 +11,7 @@ import contextlib
 import datetime as dt
 import uuid
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -24,7 +25,7 @@ from sfemu.arrow import ipc_stream, snowflake_table
 from sfemu.engine import DEFAULT_SCHEMA, Engine, quote
 from sfemu.errors import SnowflakeError
 from sfemu.session import DEFAULT_PARAMETERS, Session
-from sfemu.sql import translate
+from sfemu.sql import metadata, translate
 from sfemu.types import Column, column_from_duckdb, encode_value, fixed_column, text_column
 
 # Statement type ids as Snowflake reports them. Drivers classify by family
@@ -33,6 +34,7 @@ SELECT = 0x1000
 INSERT = 0x3100
 UPDATE = 0x3200
 DELETE = 0x3300
+MERGE = 0x3500
 ALTER_SESSION = 0x4100
 USE = 0x4300
 TRANSACTION = 0x5000
@@ -44,6 +46,9 @@ ARROW = "arrow"
 JSON = "json"
 
 _SUCCESS = "Statement executed successfully."
+# Statements that end the open transaction, as DDL does in Snowflake. ALTER
+# SESSION is an Alter too, and harmless here: it is not transactional anyway.
+_DDL_STATEMENTS = (exp.Create, exp.Drop, exp.TruncateTable, exp.Alter, exp.Comment)
 # DML statements with their statement type id and row-count columns.
 _DML: list[tuple[type[exp.Expression], int, list[str]]] = [
     (exp.Insert, INSERT, ["number of rows inserted"]),
@@ -88,6 +93,80 @@ def _dml_shape(statement: exp.Expression) -> tuple[int, list[str]] | None:
     return None
 
 
+def _rows_result(columns: list[Column], rows: list[list[Any]]) -> QueryResult:
+    """A result set built in Python; SHOW and DESCRIBE always answer in JSON."""
+    encoded = [
+        [encode_value(value, column) for value, column in zip(row, columns, strict=True)]
+        for row in rows
+    ]
+    return QueryResult(columns, encoded, SELECT)
+
+
+@contextlib.contextmanager
+def _atomic(session: Session) -> Iterator[None]:
+    """All or nothing: a transaction of our own, unless the session has one open."""
+    if session.in_transaction:
+        yield
+        return
+    session.cursor.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        session.cursor.execute("ROLLBACK")
+        raise
+    session.cursor.execute("COMMIT")
+
+
+def _is_grant(statement: exp.Expression) -> bool:
+    if isinstance(statement, exp.Grant | exp.Revoke):
+        return True
+    return isinstance(statement, exp.Command) and str(statement.this).upper() in ("GRANT", "REVOKE")
+
+
+def _pop_overwrite(session: Session, statement: exp.Expression) -> str | None:
+    """Turn INSERT OVERWRITE into a plain INSERT; return the DELETE to run before it.
+
+    The source query is read before the target is emptied in Snowflake. DuckDB
+    reads it after the DELETE, in the same transaction, so an INSERT OVERWRITE
+    that selects from its own target is refused rather than answered wrongly.
+    """
+    if not isinstance(statement, exp.Insert) or not statement.args.get("overwrite"):
+        return None
+    statement.set("overwrite", False)
+    target = statement.this.this if isinstance(statement.this, exp.Schema) else statement.this
+    key = _qualify(session, target)
+    source = statement.expression
+    if source is not None and any(
+        _qualify(session, table) == key for table in translate.relations(source)
+    ):
+        raise errors.unsupported("INSERT OVERWRITE from the target table")
+    return "DELETE FROM {}.{}.{}".format(*(quote(part) for part in key))
+
+
+def _pop_temporary(statement: exp.Create) -> bool:
+    """Remove TEMPORARY from a CREATE TABLE and say whether it was there."""
+    properties = statement.args.get("properties")
+    found = False
+    for prop in list(properties.expressions) if properties else []:
+        if isinstance(prop, exp.TemporaryProperty):
+            prop.pop()
+            found = True
+    return found
+
+
+def _comment_sql(kind: str, target: str, text: str | None) -> str:
+    literal = "NULL" if not text else "'" + text.replace("'", "''") + "'"
+    return f"COMMENT ON {kind} {target} IS {literal}"
+
+
+def _set_comment(kind: str, action: exp.AlterSet) -> str:
+    """The comment of ALTER ... SET COMMENT = '...'; nothing else can be SET yet."""
+    comment = action.find(exp.SchemaCommentProperty)
+    if comment is None or len(list(action.find_all(exp.Property))) != 1:
+        raise errors.unsupported(f"ALTER {kind} SET")
+    return comment.this.name
+
+
 def _status(message: str, statement_type_id: int) -> QueryResult:
     return QueryResult([text_column("status", nullable=False)], [[message]], statement_type_id)
 
@@ -121,7 +200,7 @@ class Executor:
         with session.lock:
             try:
                 if describe_only:
-                    result = self._describe(session, statement, binds)
+                    result = self._describe_only(session, statement, binds)
                 elif rows is None:
                     result = self._dispatch(session, statement, _bind_values(bindings))
                 else:
@@ -132,7 +211,9 @@ class Executor:
         result.array_bind_supported = isinstance(statement, exp.Insert)
         return result
 
-    def _describe(self, session: Session, statement: exp.Expression, binds: int) -> QueryResult:
+    def _describe_only(
+        self, session: Session, statement: exp.Expression, binds: int
+    ) -> QueryResult:
         """The columns a statement would return, without running it."""
         if isinstance(statement, exp.Query):
             # Zero rows of the query give DuckDB's column types; the binds have
@@ -160,24 +241,15 @@ class Executor:
             raise errors.unsupported(f"array bind for {_describe(statement)}")
         type_id, names = dml
         self._check(session, statement)
+        truncate = _pop_overwrite(session, statement)
         sql = translate.to_duckdb(statement)
         cursor = session.cursor
-        # All rows or none: use a transaction of our own unless one is open.
-        try:
-            cursor.execute("BEGIN")
-            own_transaction = True
-        except duckdb.TransactionException:
-            own_transaction = False
         affected = 0
-        try:
+        with _atomic(session):
+            if truncate:
+                cursor.execute(truncate)
             for row in rows:
                 affected += cursor.execute(sql, row).fetchone()[0]
-        except Exception:
-            if own_transaction:
-                cursor.execute("ROLLBACK")
-            raise
-        if own_transaction:
-            cursor.execute("COMMIT")
         counts = [str(affected)] + ["0"] * (len(names) - 1)
         columns = [fixed_column(name, nullable=False) for name in names]
         return QueryResult(columns, [counts], type_id)
@@ -188,6 +260,8 @@ class Executor:
         dml = _dml_shape(statement)
         if dml is not None:
             return self._dml(session, statement, params, *dml)
+        if isinstance(statement, _DDL_STATEMENTS):
+            self._commit_before_ddl(session)
         if isinstance(statement, exp.Create):
             return self._create(session, statement, params)
         if isinstance(statement, exp.Drop):
@@ -199,6 +273,26 @@ class Executor:
             return self._use(session, statement)
         if isinstance(statement, exp.Alter) and statement.args.get("kind") == "SESSION":
             return self._alter_session(session, statement)
+        if isinstance(statement, exp.Alter) and statement.args.get("kind") in _RELATION_KINDS:
+            return self._alter(session, statement)
+        if isinstance(statement, exp.Merge):
+            return self._merge(session, statement, params)
+        if isinstance(statement, exp.Show):
+            return self._show(session, statement)
+        if isinstance(statement, exp.Describe):
+            return self._describe_relation(session, statement)
+        if isinstance(statement, exp.Comment):
+            return self._comment(session, statement)
+        if _is_grant(statement):
+            # There is no access control yet: every role may do everything.
+            return _status(_SUCCESS, DDL)
+        if isinstance(statement, exp.Command):
+            # Statements sqlglot keeps as raw text.
+            head, rest = str(statement.this).upper(), str(statement.expression or "")
+            if head == "SHOW" and rest.split()[:1] and rest.split()[0].upper() == "GRANTS":
+                return _rows_result(metadata.GRANTS, [])
+            if head == "ALTER":
+                return self._alter_column_comments(session, f"ALTER {rest}")
         if isinstance(statement, exp.Transaction | exp.Commit | exp.Rollback):
             return self._transaction(session, statement)
         raise errors.unsupported(_describe(statement))
@@ -225,12 +319,15 @@ class Executor:
         for table in translate.relations(statement):
             if table is creating:
                 continue
-            database, schema, name = _qualify(session, table)
-            unqualified = not table.db
-            if not self._engine.relation_visible(
-                session.cursor, database, schema, name, temporary=unqualified
-            ):
-                raise errors.object_not_found(f"Object '{name}' does not exist or not authorized.")
+            if self._kind(session, table) is None:
+                raise errors.object_not_found(
+                    f"Object '{table.name}' does not exist or not authorized."
+                )
+        metadata.expand_information_schema(statement, session.database, self._engine.started)
+
+    def _kind(self, session: Session, table: exp.Table) -> str | None:
+        """'TABLE' or 'VIEW' if the session can see this relation, else None."""
+        return self._engine.relation_kind(session.cursor, *_qualify(session, table))
 
     def _query(self, session: Session, statement: exp.Expression, params: list) -> QueryResult:
         translate.name_projections(statement)
@@ -281,8 +378,13 @@ class Executor:
         statement_type_id: int,
         names: list[str],
     ) -> QueryResult:
-        self._run(session, statement, params)
-        affected = session.cursor.fetchone()[0]
+        self._check(session, statement)
+        truncate = _pop_overwrite(session, statement)
+        sql = translate.to_duckdb(statement)
+        with _atomic(session):
+            if truncate:
+                session.cursor.execute(truncate)
+            affected = session.cursor.execute(sql, params).fetchone()[0]
         # Extra counters (multi-joined rows) are not tracked by DuckDB; report zero.
         counts = [str(affected)] + ["0"] * (len(names) - 1)
         columns = [fixed_column(name, nullable=False) for name in names]
@@ -325,12 +427,25 @@ class Executor:
         if kind in _RELATION_KINDS:
             self._require_namespace(session, statement)
             database, schema, name = _qualify(session, target)
-            exists = self._engine.has_relation(kind, database, schema, name)
-            if exists and if_not_exists:
+            found = self._kind(session, target)
+            if found and if_not_exists:
                 return _status(f"{name} already exists, statement succeeded.", DDL)
-            if exists and not replace:
+            if found and not replace:
                 raise _already_exists(name)
+            if found and found != kind:
+                raise SnowflakeError(
+                    "002002",
+                    "42710",
+                    f"SQL compilation error:\nObject found is of type '{found}', "
+                    f"not specified type '{kind}'.",
+                )
+            temporary = _pop_temporary(statement)
             self._run(session, statement, params, creating=target)
+            key = (database, schema, name)
+            if temporary:
+                session.temporary_tables.add(key)
+            else:
+                session.temporary_tables.discard(key)
             return _status(f"{_RELATION_KINDS[kind]} {name} successfully created.", DDL)
 
         raise errors.unsupported(f"CREATE {kind}")
@@ -359,9 +474,13 @@ class Executor:
                     session.use(database, None)
         elif kind in _RELATION_KINDS:
             self._require_namespace(session, statement)
-            exists = self._engine.has_relation(kind, *_qualify(session, target))
+            exists = self._kind(session, target) == kind
             if exists:
+                # Snowflake's CASCADE is about foreign keys; DuckDB's would also
+                # drop the views that select from the table.
+                statement.set("cascade", False)
                 session.cursor.execute(translate.to_duckdb(statement))
+                session.temporary_tables.discard(_qualify(session, target))
         else:
             raise errors.unsupported(f"DROP {kind}")
 
@@ -372,6 +491,169 @@ class Executor:
             return _status(message, DDL)
         label = _RELATION_KINDS.get(kind, kind.capitalize())
         raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
+
+    def _alter(self, session: Session, statement: exp.Alter) -> QueryResult:
+        kind = statement.args["kind"]
+        target = statement.this
+        self._require_namespace(session, statement)
+        database, schema, name = _qualify(session, target)
+        if self._kind(session, target) != kind:
+            if statement.args.get("exists"):
+                return _status(_SUCCESS, DDL)
+            label = _RELATION_KINDS[kind]
+            raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
+        relation = f"{quote(database)}.{quote(schema)}.{quote(name)}"
+        commands = []
+        for action in statement.args.get("actions") or []:
+            if isinstance(action, exp.AlterRename):
+                new_database, new_schema, new_name = _qualify(session, action.this)
+                if (new_database, new_schema) != (database, schema):
+                    raise errors.unsupported(f"ALTER {kind} RENAME TO another schema")
+                if self._kind(session, action.this) is not None:
+                    raise _already_exists(new_name)
+                commands.append(f"ALTER {kind} {relation} RENAME TO {quote(new_name)}")
+                if (database, schema, name) in session.temporary_tables:
+                    session.temporary_tables.discard((database, schema, name))
+                    session.temporary_tables.add((database, schema, new_name))
+            elif isinstance(action, exp.AlterSet):
+                commands.append(_comment_sql(kind, relation, _set_comment(kind, action)))
+            elif isinstance(action, exp.AlterColumn) and action.args.get("comment") is not None:
+                column = f"{relation}.{quote(action.name)}"
+                commands.append(_comment_sql("COLUMN", column, action.args["comment"].name))
+            elif isinstance(action, exp.ColumnDef | exp.Drop | exp.RenameColumn | exp.AlterColumn):
+                # DuckDB runs one action per ALTER statement.
+                single = exp.Alter(this=target.copy(), kind=kind, actions=[action.copy()])
+                translate.check_supported(single)
+                commands.append(translate.to_duckdb(single))
+            else:
+                raise errors.unsupported(f"ALTER {kind} ... {action.key.upper()}")
+        with _atomic(session):
+            for command in commands:
+                session.cursor.execute(command)
+        return _status(_SUCCESS, DDL)
+
+    def _alter_column_comments(self, session: Session, sql: str) -> QueryResult:
+        """ALTER TABLE t ALTER [COLUMN] a COMMENT '..', b COMMENT '..' — dbt's persist_docs."""
+        tokens = translate.tokens(sql)
+        kinds = [kind for kind, _ in tokens]
+        unsupported = errors.unsupported("ALTER")
+        if kinds[:2] != ["ALTER", "TABLE"] or "ALTER" not in kinds[2:]:
+            raise unsupported
+        split = kinds.index("ALTER", 2)
+        name_tokens = tokens[2:split]
+        if_exists = [text.upper() for _, text in name_tokens[:2]] == ["IF", "EXISTS"]
+        if if_exists:
+            name_tokens = name_tokens[2:]
+        name = "".join(quote(text) if kind == "IDENTIFIER" else text for kind, text in name_tokens)
+        table = translate.parse(f"SELECT * FROM {name}")[0].find(exp.Table)
+        if table is None or not isinstance(table.this, exp.Identifier):
+            raise unsupported
+        comments: list[tuple[str, str]] = []
+        items = tokens[split + 1 :]
+        while items:
+            if items[0][0] == "COLUMN":
+                items = items[1:]
+            if len(items) < 3 or items[1][0] != "COMMENT" or "STRING" not in items[2][0]:
+                raise unsupported
+            (kind, column), _, (_, text) = items[:3]
+            comments.append((column if kind == "IDENTIFIER" else column.upper(), text))
+            items = items[3:]
+            if items and items[0][0] != "COMMA":
+                raise unsupported
+            items = items[1:]
+        if table.catalog is None and session.database is None:
+            raise _no_current("database", "ALTER TABLE")
+        database, schema, table_name = _qualify(session, table)
+        if self._kind(session, table) is None:
+            if if_exists:
+                return _status(_SUCCESS, DDL)
+            raise errors.object_not_found(f"Table '{table_name}' does not exist or not authorized.")
+        relation = f"{quote(database)}.{quote(schema)}.{quote(table_name)}"
+        with _atomic(session):
+            for column, text in comments:
+                session.cursor.execute(_comment_sql("COLUMN", f"{relation}.{quote(column)}", text))
+        return _status(_SUCCESS, DDL)
+
+    def _comment(self, session: Session, statement: exp.Comment) -> QueryResult:
+        kind = str(statement.args.get("kind") or "").upper()
+        text = statement.expression.name if statement.expression is not None else None
+        target = statement.this
+        if kind in _RELATION_KINDS and isinstance(target, exp.Table):
+            self._require_namespace(session, statement)
+            found = self._kind(session, target)
+            if found is None:
+                if statement.args.get("exists"):
+                    return _status(_SUCCESS, DDL)
+                raise errors.object_not_found(
+                    f"Object '{target.name}' does not exist or not authorized."
+                )
+            database, schema, name = _qualify(session, target)
+            relation = f"{quote(database)}.{quote(schema)}.{quote(name)}"
+            # Snowflake accepts COMMENT ON TABLE for a view; DuckDB wants the kind right.
+            session.cursor.execute(_comment_sql(found, relation, text))
+        elif kind == "COLUMN" and isinstance(target, exp.Column):
+            parts = [part.name for part in target.parts]
+            if len(parts) < 2:
+                raise errors.syntax_error("COMMENT ON COLUMN needs a table name.")
+            *table_parts, column = parts
+            table = exp.to_table(".".join(quote(part) for part in table_parts))
+            database, schema, name = _qualify(session, table)
+            if self._kind(session, table) is None:
+                if statement.args.get("exists"):
+                    return _status(_SUCCESS, DDL)
+                raise errors.object_not_found(f"Object '{name}' does not exist or not authorized.")
+            relation = f"{quote(database)}.{quote(schema)}.{quote(name)}.{quote(column)}"
+            session.cursor.execute(_comment_sql("COLUMN", relation, text))
+        # Comments on schemas, databases and other objects are accepted and dropped:
+        # DuckDB has nowhere to keep them.
+        return _status(_SUCCESS, DDL)
+
+    def _merge(self, session: Session, statement: exp.Merge, params: list) -> QueryResult:
+        self._check(session, statement)
+        whens = statement.args["whens"].expressions
+        thens = [when.args.get("then") for when in whens]
+        present = {
+            "inserted": any(isinstance(then, exp.Insert) for then in thens),
+            "updated": any(isinstance(then, exp.Update) for then in thens),
+            "deleted": any(not isinstance(then, exp.Insert | exp.Update) for then in thens),
+        }
+        # DuckDB reports one total; Snowflake a count per kind of action taken.
+        sql = translate.to_duckdb(statement) + " RETURNING merge_action"
+        actions = [row[0] for row in session.cursor.execute(sql, params).fetchall()]
+        tally = {
+            "inserted": actions.count("INSERT"),
+            "updated": actions.count("UPDATE"),
+            "deleted": actions.count("DELETE"),
+        }
+        names = [name for name, used in present.items() if used]
+        columns = [fixed_column(f"number of rows {name}", nullable=False) for name in names]
+        return QueryResult(columns, [[str(tally[name]) for name in names]], MERGE)
+
+    # Catalog views ---------------------------------------------------------
+
+    def _show(self, session: Session, statement: exp.Show) -> QueryResult:
+        columns, rows = metadata.show(
+            session.cursor,
+            statement,
+            database=session.database,
+            schema=session.schema,
+            started=self._engine.started,
+        )
+        return _rows_result(columns, rows)
+
+    def _describe_relation(self, session: Session, statement: exp.Describe) -> QueryResult:
+        kind = str(statement.args.get("kind") or "TABLE").upper()
+        target = statement.this
+        if kind not in _RELATION_KINDS or not isinstance(target, exp.Table):
+            raise errors.unsupported(f"DESCRIBE {kind}")
+        self._require_namespace(session, statement)
+        database, schema, name = _qualify(session, target)
+        found = self._kind(session, target)
+        # DESCRIBE TABLE also describes a view; DESCRIBE VIEW only views.
+        if found is None or (kind == "VIEW" and found != "VIEW"):
+            label = _RELATION_KINDS[kind]
+            raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
+        return _rows_result(*metadata.describe(session.cursor, database, schema, name))
 
     def _drop_database(self, session: Session, name: str) -> None:
         if session.database == name:
@@ -430,9 +712,17 @@ class Executor:
     def _transaction(self, session: Session, statement: exp.Expression) -> QueryResult:
         # COMMIT or ROLLBACK with nothing open, or BEGIN inside a transaction:
         # Snowflake accepts all three, DuckDB refuses them.
-        with contextlib.suppress(duckdb.TransactionException):
-            session.cursor.execute(translate.to_duckdb(statement))
+        begin = isinstance(statement, exp.Transaction)
+        if begin != session.in_transaction:
+            session.cursor.execute("BEGIN" if begin else translate.to_duckdb(statement))
+            session.in_transaction = begin
         return _status(_SUCCESS, TRANSACTION)
+
+    def _commit_before_ddl(self, session: Session) -> None:
+        """DDL in Snowflake commits the open transaction and runs in one of its own."""
+        if session.in_transaction:
+            session.cursor.execute("COMMIT")
+            session.in_transaction = False
 
     def _require_namespace(self, session: Session, statement: exp.Expression) -> None:
         if session.database is not None and session.schema is not None:

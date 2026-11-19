@@ -6,8 +6,8 @@ existing code connects to it unchanged, and runs the SQL on DuckDB.
 The goal is to develop and test Snowflake pipelines on a laptop or in CI
 without an account and without spending credits.
 
-**Status: early skeleton.** One driver and a small SQL surface work today;
-see [what works](#what-works) and the [implementation plan](docs/PLAN.md).
+**Status: early.** The Python connector, Snowflake CLI and dbt work against
+it; see [what works](#what-works) and the [implementation plan](docs/PLAN.md).
 
 ## Quick start
 
@@ -66,14 +66,19 @@ in memory; restarting the container resets the emulator.
 ## What works
 
 Verified by the test suite with `snowflake-connector-python` 5.2, 3.15 and 4.8,
-and with Snowflake CLI 3.34:
+Snowflake CLI 3.34 and dbt (dbt Core 1.11 with dbt-snowflake, and the dbt
+Fusion engine 2.0): `dbt seed`, `run`, `test`, `snapshot`, `build` and
+`docs generate`, with table, view and incremental (merge, delete+insert,
+append) models.
 
 | Area | Supported |
 |---|---|
 | Protocol | login, query, logout; JSON and Arrow result formats |
 | Queries | `SELECT` and set operations, translated by sqlglot |
-| DML | `INSERT`, `UPDATE`, `DELETE`, with Snowflake's row-count result sets |
-| DDL | `CREATE` / `DROP` for databases, schemas, tables, views; `TRUNCATE` |
+| DML | `INSERT`, `INSERT OVERWRITE`, `UPDATE`, `DELETE`, `MERGE`, with Snowflake's row-count result sets |
+| DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, add / drop / rename / retype column, comments); `COMMENT ON` |
+| Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`); `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
+| Access control | none: `GRANT` and `REVOKE` are accepted and ignored, `SHOW GRANTS` is empty |
 | Session | `USE`, `ALTER SESSION`, login session parameters, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
 | Binding | client-side (pyformat) and positional `?` for numbers, text, booleans, dates, times, timestamps and binary; `executemany` as an array bind |
 | Results | Arrow for `fetch_pandas_all` / `get_result_batches`; large results in downloadable chunks |
@@ -86,10 +91,9 @@ Statements outside this list are rejected with Snowflake's
 `000002 (0A000): Unsupported feature` instead of being passed to DuckDB. A
 statement that passes here by accident and fails on Snowflake is worse than
 one that fails here honestly. The same goes for what hides inside an accepted
-statement: functions the emulator has no Snowflake model for, DuckDB's table
-functions (`read_csv`, `range`, `unnest`, ...) and `INFORMATION_SCHEMA`, which
-is not implemented yet. Table and view names are case-sensitive, as on
-Snowflake.
+statement: functions the emulator has no Snowflake model for and DuckDB's
+table functions (`read_csv`, `range`, `unnest`, ...). Table and view names are
+case-sensitive, as on Snowflake.
 
 SQL has no access to the server's files or network: DuckDB runs with external
 access switched off.
@@ -114,6 +118,15 @@ they do on Snowflake.
   (`1 + 1`), which can differ in spacing from the text as typed (`1+1`).
 - Error messages for cases not yet mapped carry DuckDB's wording.
 - `AUTOCOMMIT = FALSE` is accepted but not applied.
+- A statement that fails inside an explicit transaction aborts it: everything
+  until `ROLLBACK` fails too. Snowflake would carry on with the transaction.
+- Temporary tables are dropped when their session ends, but until then other
+  sessions can see them.
+- The catalog has no history: every object reports the emulator's start time
+  as its creation time, `SYSADMIN` as its owner, and transient tables are
+  listed as ordinary ones. View definitions are shown as DuckDB rewrote them.
+- `/` on integers gives a `FLOAT`, where Snowflake gives a `NUMBER` with six
+  decimal places.
 
 ## Development
 

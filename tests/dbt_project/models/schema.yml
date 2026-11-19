@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: customers
+    description: One row per customer.
+    config:
+      persist_docs:
+        relation: true
+        columns: true
+      grants:
+        select: [reporter]
+    columns:
+      - name: customer_id
+        description: The customer's key.
+        data_tests: [unique, not_null]
+      - name: order_count
+        data_tests: [not_null]
+  - name: stg_orders
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [placed, completed, returned]
+      - name: customer_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('customers')
+                field: customer_id
+  - name: orders_merged
+    columns:
+      - name: order_id
+        data_tests: [unique]

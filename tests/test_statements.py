@@ -180,11 +180,11 @@ def test_syntax_error(conn):
 @pytest.mark.parametrize(
     "sql",
     [
-        "show tables",
+        "show warehouses",
         "create warehouse wh",
-        "grant select on table t to role r",
         "put file:///tmp/data.csv @stage",
-        "merge into t using s on t.id = s.id when matched then delete",
+        "call some_procedure()",
+        "describe warehouse wh",
     ],
 )
 def test_unsupported_statements_are_rejected_not_guessed(conn, sql):
@@ -237,7 +237,7 @@ def test_create_or_replace_schema(conn):
         "select * from read_csv('/etc/hosts')",
         "select * from read_text('/etc/hosts')",
         "create table leak as select * from read_text('/etc/hosts')",
-        "select * from information_schema.tables",
+        "select * from information_schema.stages",
     ],
 )
 def test_duckdb_only_sql_is_rejected(conn, sql):
@@ -280,16 +280,41 @@ def test_cte_and_temporary_names_resolve(conn):
     assert cur.execute("select * from scratch").fetchall() == [(1,)]
 
 
-def test_a_transaction_sees_the_tables_it_created(conn):
+def test_ddl_commits_the_open_transaction(conn):
     cur = conn.cursor()
+    cur.execute("create table t (id int)")
     cur.execute("begin")
-    cur.execute("create table fresh (id int)")
-    cur.execute("insert into fresh values (1)")
-    assert cur.execute("select * from fresh").fetchall() == [(1,)]
+    cur.execute("insert into t values (1)")
+    cur.execute("create table fresh (id int)")  # commits the insert
+    cur.execute("insert into fresh values (1)")  # no transaction is open any more
     cur.execute("rollback")
+    assert cur.execute("select count(*) from t").fetchone() == (1,)
+    assert cur.execute("select count(*) from fresh").fetchone() == (1,)
+
+
+def test_begin_inside_a_transaction_keeps_it(conn):
+    cur = conn.cursor()
+    cur.execute("create table t (id int)")
+    cur.execute("begin")
+    cur.execute("insert into t values (1)")
+    cur.execute("begin")
+    cur.executemany("insert into t values (%s)", [(2,), (3,)])
+    cur.execute("insert overwrite into t values (9)")
+    cur.execute("rollback")
+    assert cur.execute("select count(*) from t").fetchone() == (0,)
+
+
+def test_insert_overwrite(conn):
+    cur = conn.cursor()
+    cur.execute("create table t (id int)")
+    cur.execute("insert into t values (1), (2)")
+    cur.execute("insert overwrite into t values (7), (8), (9)")
+    assert cur.rowcount == 3
+    assert cur.execute("select id from t order by id").fetchall() == [(7,), (8,), (9,)]
     with pytest.raises(ProgrammingError) as failure:
-        cur.execute("select * from fresh")
-    assert failure.value.errno == 2003
+        cur.execute("insert overwrite into t select id + 1 from t")
+    assert failure.value.errno == 2
+    assert cur.execute("select count(*) from t").fetchone() == (3,)
 
 
 @pytest.mark.parametrize("name", ["int", "integer", "bigint", "smallint", "tinyint", "byteint"])

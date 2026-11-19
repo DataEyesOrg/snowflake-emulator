@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import secrets
 import threading
@@ -52,6 +53,12 @@ class Session:
     role: str | None = None
     parameters: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_PARAMETERS))
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Whether BEGIN opened a transaction that is still running. Tracked here
+    # because asking DuckDB (a second BEGIN) would abort the transaction.
+    in_transaction: bool = False
+    # DuckDB's temporary tables live outside any schema, Snowflake's inside one.
+    # They are therefore ordinary tables that the session drops when it closes.
+    temporary_tables: set[tuple[str, str, str]] = field(default_factory=set)
 
     def use(self, database: str | None, schema: str | None) -> None:
         """Point both the session and its DuckDB cursor at a database and schema."""
@@ -150,4 +157,9 @@ class SessionManager:
         with self._lock:
             self._by_token.pop(session.token, None)
         with session.lock:
+            for database, schema, name in session.temporary_tables:
+                with contextlib.suppress(duckdb.Error):
+                    session.cursor.execute(
+                        f"DROP TABLE IF EXISTS {quote(database)}.{quote(schema)}.{quote(name)}"
+                    )
             session.cursor.close()

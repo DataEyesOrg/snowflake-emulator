@@ -74,6 +74,54 @@ jobs:
       - name: The CLI tests really ran
         run: uv run pytest tests/test_snowflake_cli.py -q | grep -q "3 passed"
 
+  # Phase 2 acceptance: dbt Core drives the emulator through dbt-snowflake.
+  dbt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv tool install "dbt-core>=1.10,<1.12" --with "dbt-snowflake>=1.10,<1.12"
+      - run: uv sync --frozen
+      - run: uv run pytest tests/test_dbt.py -rs
+      - name: The dbt tests really ran
+        run: uv run pytest tests/test_dbt.py -q | grep -q "3 passed"
+      - name: jaffle_shop
+        run: |
+          git clone --depth 1 https://github.com/dbt-labs/jaffle_shop.git "$RUNNER_TEMP/jaffle_shop"
+          cat > "$RUNNER_TEMP/profiles.yml" <<'YAML'
+          jaffle_shop:
+            target: dev
+            outputs:
+              dev:
+                type: snowflake
+                account: local
+                user: ci
+                password: ci
+                role: dev
+                database: analytics
+                warehouse: wh
+                schema: jaffle
+                threads: 4
+                host: 127.0.0.1
+                port: 8085
+                protocol: http
+          YAML
+          uv run sfemu serve &
+          for _ in $(seq 30); do
+            curl -sf http://127.0.0.1:8085/health && break
+            sleep 1
+          done
+          cd "$RUNNER_TEMP/jaffle_shop"
+          export DBT_PROFILES_DIR="$RUNNER_TEMP" DBT_SEND_ANONYMOUS_USAGE_STATS=false
+          dbt seed
+          dbt run
+          dbt test
+          dbt run
+          dbt docs generate
+
   docker:
     runs-on: ubuntu-latest
     steps:

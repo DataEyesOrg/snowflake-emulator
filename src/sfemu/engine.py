@@ -7,13 +7,14 @@ its own DuckDB cursor, so the current database and schema are per session.
 
 from __future__ import annotations
 
+import datetime as dt
 import threading
 
 import duckdb
 
 DEFAULT_SCHEMA = "PUBLIC"
 # DuckDB's own catalogs, never visible as Snowflake databases.
-_INTERNAL_DATABASES = ("memory", "system", "temp")
+INTERNAL_DATABASES = ("memory", "system", "temp")
 
 
 def quote(identifier: str) -> str:
@@ -27,6 +28,8 @@ class Engine:
         # It cannot be switched back on while the database is running.
         self._root = duckdb.connect(":memory:", config={"enable_external_access": False})
         self._catalog_lock = threading.Lock()
+        # DuckDB keeps no creation times; every object is reported as created now.
+        self.started = dt.datetime.now(dt.UTC).replace(microsecond=0)
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         cursor = self._root.cursor()
@@ -44,62 +47,38 @@ class Engine:
             cursor.close()
 
     def has_database(self, name: str) -> bool:
-        if name in _INTERNAL_DATABASES:
+        if name in INTERNAL_DATABASES:
             return False
         return self._scalar("SELECT 1 FROM duckdb_databases() WHERE database_name = ?", [name])
 
     def has_schema(self, database: str, schema: str) -> bool:
         return self._scalar(
-            "SELECT 1 FROM duckdb_schemas() WHERE database_name = ? AND schema_name = ?",
+            "SELECT 1 FROM duckdb_schemas() "
+            "WHERE database_name = ? AND schema_name = ? AND NOT internal",
             [database, schema],
         )
 
-    def has_relation(self, kind: str, database: str, schema: str, name: str) -> bool:
-        source = "duckdb_views()" if kind == "VIEW" else "duckdb_tables()"
-        column = "view_name" if kind == "VIEW" else "table_name"
-        return self._scalar(
-            f"SELECT 1 FROM {source} WHERE database_name = ? AND schema_name = ? AND {column} = ?",
-            [database, schema, name],
-        )
-
     @staticmethod
-    def relation_visible(
-        cursor: duckdb.DuckDBPyConnection,
-        database: str | None,
-        schema: str | None,
-        name: str,
-        *,
-        temporary: bool,
-    ) -> bool:
-        """Whether a table or view with exactly this name exists, as seen by a session.
+    def relation_kind(
+        cursor: duckdb.DuckDBPyConnection, database: str | None, schema: str | None, name: str
+    ) -> str | None:
+        """'TABLE' or 'VIEW' when a relation with exactly this name exists, else None.
 
         DuckDB resolves identifiers case-insensitively and Snowflake does not,
         so a reference is checked here before DuckDB gets to resolve it. The
-        lookup runs on the session's own cursor, which also sees its temporary
-        tables and whatever its open transaction has created.
+        lookup runs on the session's own cursor, which also sees whatever its
+        open transaction has created.
         """
-        found = False
-        if database is not None and schema is not None and database not in _INTERNAL_DATABASES:
-            found = (
-                cursor.execute(
-                    "SELECT 1 FROM duckdb_tables() "
-                    "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
-                    "UNION ALL SELECT 1 FROM duckdb_views() "
-                    "WHERE database_name = ? AND schema_name = ? AND view_name = ?",
-                    [database, schema, name] * 2,
-                ).fetchone()
-                is not None
-            )
-        if not found and temporary:
-            found = (
-                cursor.execute(
-                    "SELECT 1 FROM duckdb_tables() WHERE temporary AND table_name = ? "
-                    "UNION ALL SELECT 1 FROM duckdb_views() WHERE temporary AND view_name = ?",
-                    [name, name],
-                ).fetchone()
-                is not None
-            )
-        return found
+        if database is None or schema is None or database in INTERNAL_DATABASES:
+            return None
+        found = cursor.execute(
+            "SELECT 'TABLE' FROM duckdb_tables() "
+            "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+            "UNION ALL SELECT 'VIEW' FROM duckdb_views() "
+            "WHERE database_name = ? AND schema_name = ? AND view_name = ?",
+            [database, schema, name] * 2,
+        ).fetchone()
+        return found[0] if found else None
 
     def create_database(self, name: str) -> None:
         with self._catalog_lock:

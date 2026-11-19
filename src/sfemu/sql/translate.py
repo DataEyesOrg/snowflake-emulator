@@ -28,7 +28,36 @@ def parse(sql: str) -> list[exp.Expression]:
             if isinstance(pair.this, exp.Identifier):
                 pair.this.set("quoted", True)
     # Unquoted identifiers fold to upper case in Snowflake; do it once, here.
-    return [normalize_identifiers(s, dialect=SNOWFLAKE) for s in statements]
+    statements = [normalize_identifiers(s, dialect=SNOWFLAKE) for s in statements]
+    for statement in statements:
+        _rewrite_conversions(statement)
+    return statements
+
+
+# TO_TIMESTAMP* of one argument: sqlglot models it only for literals, since what
+# it does depends on the argument's type. For text and timestamps it is a cast;
+# a number (an epoch) fails in DuckDB's cast instead of being misread.
+_CONVERSIONS = {
+    "TO_TIMESTAMP": "TIMESTAMPNTZ",
+    "TO_TIMESTAMP_NTZ": "TIMESTAMPNTZ",
+    "TO_TIMESTAMP_LTZ": "TIMESTAMPLTZ",
+    "TO_TIMESTAMP_TZ": "TIMESTAMPTZ",
+}
+
+
+def _rewrite_conversions(statement: exp.Expression) -> None:
+    for node in list(statement.find_all(exp.Anonymous)):
+        target = _CONVERSIONS.get(node.name.upper())
+        if target and len(node.expressions) == 1:
+            node.replace(exp.cast(node.expressions[0].copy(), target, dialect=SNOWFLAKE))
+
+
+def tokens(sql: str) -> list[tuple[str, str]]:
+    """(token type, text) pairs of a statement sqlglot could only keep as raw text."""
+    try:
+        return [(t.token_type.name, t.text) for t in sqlglot.tokenize(sql, read=SNOWFLAKE)]
+    except TokenError as exc:
+        raise errors.syntax_error(_plain(str(exc))) from exc
 
 
 # Snowflake's INT, BIGINT, SMALLINT, TINYINT and BYTEINT are all synonyms of
@@ -47,6 +76,17 @@ def to_duckdb(statement: exp.Expression) -> str:
     for data_type in list(statement.find_all(exp.DataType)):
         if data_type.this in _INTEGER_TYPES:
             data_type.replace(exp.DataType.build("DECIMAL(38, 0)"))
+    for merge in statement.find_all(exp.Merge):
+        # DuckDB takes bare column names as the targets of UPDATE SET.
+        for update in merge.find_all(exp.Update):
+            for assignment in update.expressions:
+                if isinstance(assignment.this, exp.Column):
+                    assignment.this.replace(exp.column(assignment.this.this.copy()))
+    for properties in statement.find_all(exp.Properties):
+        # Dropped silently by the generator otherwise, with a warning per statement.
+        for prop in list(properties.expressions):
+            if isinstance(prop, exp.TransientProperty | exp.CopyGrantsProperty):
+                prop.pop()
     # Every identifier is quoted so DuckDB stores the case Snowflake would.
     return statement.sql(dialect=DUCKDB, identify=True)
 
@@ -61,7 +101,9 @@ def relations(statement: exp.Expression) -> list[exp.Table]:
     return [
         table
         for table in statement.find_all(exp.Table)
-        if isinstance(table.this, exp.Identifier) and (table.db or table.name not in cte_names)
+        if isinstance(table.this, exp.Identifier)
+        and (table.db or table.name not in cte_names)
+        and table.db != "INFORMATION_SCHEMA"  # answered by sfemu.sql.metadata
     ]
 
 
@@ -81,9 +123,6 @@ def check_supported(statement: exp.Expression) -> None:
             raise errors.unsupported(f"table function {_callable_name(node.this)}")
         if isinstance(node, exp.Unnest | exp.ReadCSV):
             raise errors.unsupported(f"table function {_callable_name(node)}")
-        if isinstance(node, exp.Table) and node.db.upper() == "INFORMATION_SCHEMA":
-            # DuckDB has an information_schema of its own, shaped differently.
-            raise errors.unsupported("INFORMATION_SCHEMA")
 
 
 def _callable_name(node: exp.Expression) -> str:
