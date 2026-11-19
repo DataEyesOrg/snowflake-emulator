@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  # The locked connector (5.x) on the supported Python range.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --frozen
+      - run: uv run pytest
+
+  # Connector 5.x talks to the server through a native core, 3.x and 4.x
+  # through their own HTTP and Arrow code, so each line is tested separately.
+  connectors:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        connector: ["3.15.0", "4.8.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: >
+          uv run --isolated
+          --with "snowflake-connector-python[pandas]==${{ matrix.connector }}"
+          pytest
+
+  snowflake-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv tool install snowflake-cli
+      - run: uv sync --frozen
+      # -rs lists skips: these tests skip silently when `snow` is missing.
+      - run: uv run pytest tests/test_snowflake_cli.py -rs
+      - name: The CLI tests really ran
+        run: uv run pytest tests/test_snowflake_cli.py -q | grep -q "3 passed"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: docker build -t sfemu .
+      - run: docker run -d --name sfemu -p 8085:8085 sfemu
+      - name: Wait for the emulator
+        run: |
+          for _ in $(seq 30); do
+            curl -sf http://127.0.0.1:8085/health && exit 0
+            sleep 1
+          done
+          docker logs sfemu
+          exit 1
+      - run: uv sync --frozen
+      - name: Query the container with the Python connector
+        run: |
+          uv run python - <<'PY'
+          import snowflake.connector
+
+          conn = snowflake.connector.connect(
+              user="ci", password="ci", account="local",
+              host="127.0.0.1", port=8085, protocol="http", database="demo",
+          )
+          cur = conn.cursor()
+          cur.execute("create table orders as select 1 id, 9.99::number(10, 2) amount")
+          frame = cur.execute("select * from orders").fetch_pandas_all()
+          assert frame.to_dict("records") == [{"ID": 1, "AMOUNT": 9.99}], frame
+          conn.close()
+          PY
+      - if: failure()
+        run: docker logs sfemu

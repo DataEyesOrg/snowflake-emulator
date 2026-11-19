@@ -164,6 +164,21 @@ def create_app(*, auto_create: bool = True) -> Starlette:
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "version": __version__})
 
+    def guarded(endpoint: Any) -> Any:
+        # A bug in the emulator must reach the driver as a Snowflake error. An
+        # HTTP 500 would make it retry the statement until its timeout instead.
+        async def wrapper(request: Request) -> Response:
+            try:
+                return await endpoint(request)
+            except SnowflakeError:
+                raise
+            except Exception as exc:
+                log.exception("unhandled error in %s", request.url.path)
+                failure = errors.internal(f"{type(exc).__name__}: {exc}")
+                return await on_snowflake_error(request, failure)
+
+        return wrapper
+
     async def on_snowflake_error(request: Request, exc: SnowflakeError) -> JSONResponse:
         # Drivers expect HTTP 200 with success=false; the error is in the envelope.
         return JSONResponse(
@@ -177,10 +192,10 @@ def create_app(*, auto_create: bool = True) -> Starlette:
 
     app = Starlette(
         routes=[
-            Route("/session/v1/login-request", login, methods=["POST"]),
-            Route("/queries/v1/query-request", query, methods=["POST"]),
-            Route("/session", session_endpoint, methods=["POST"]),
-            Route("/session/token-request", renew_token, methods=["POST"]),
+            Route("/session/v1/login-request", guarded(login), methods=["POST"]),
+            Route("/queries/v1/query-request", guarded(query), methods=["POST"]),
+            Route("/session", guarded(session_endpoint), methods=["POST"]),
+            Route("/session/token-request", guarded(renew_token), methods=["POST"]),
             Route("/session/heartbeat", acknowledge, methods=["GET", "POST"]),
             Route("/telemetry/send", acknowledge, methods=["POST"]),
             Route("/results/{query_id}/{index:int}", result_chunk, methods=["GET"]),
@@ -203,7 +218,13 @@ async def _body(request: Request) -> dict[str, Any]:
         return {}
     if request.headers.get("content-encoding") == "gzip":
         raw = gzip.decompress(raw)
-    return json.loads(raw)
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise errors.bad_request("the body is not JSON") from exc
+    if not isinstance(body, dict):
+        raise errors.bad_request("the body must be a JSON object")
+    return body
 
 
 def _object_name(raw: str | None) -> str | None:

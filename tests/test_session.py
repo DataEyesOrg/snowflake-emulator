@@ -98,3 +98,25 @@ def test_qmark_binding(server):
             assert row == (7, "seven", 7.5)
     finally:
         snowflake.connector.paramstyle = "pyformat"
+
+
+def test_bare_use_names_a_database(conn):
+    cur = conn.cursor()
+    cur.execute("create database other")
+    cur.execute("create schema staging")
+    cur.execute("use testdb")
+    assert (conn.database, conn.schema) == ("TESTDB", "PUBLIC")
+    cur.execute("use other.staging")  # qualified, so it is a schema
+    assert (conn.database, conn.schema) == ("OTHER", "STAGING")
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("use staging")  # a schema, not a database
+    assert failure.value.errno == 2043
+
+
+def test_unset_timezone_restores_the_default(conn):
+    cur = conn.cursor()
+    noon = "select '2024-06-01 12:00:00'::timestamp_ltz"
+    cur.execute("alter session set timezone = 'Europe/Rome'")
+    assert cur.execute(noon).fetchone()[0].utcoffset().total_seconds() == 2 * 3600
+    cur.execute("alter session unset timezone")
+    assert cur.execute(noon).fetchone()[0].utcoffset().total_seconds() == 0

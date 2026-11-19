@@ -197,3 +197,30 @@ def test_multiple_statements_are_rejected(conn):
     with pytest.raises(ProgrammingError) as failure:
         conn.cursor().execute("select 1; select 2")
     assert failure.value.errno == 8
+
+
+@pytest.mark.parametrize("sql", ["select 'abc", 'select "abc', "select 1 /* open"])
+def test_unterminated_tokens_are_syntax_errors(conn, sql):
+    # The tokenizer fails before the parser does; it must not surface as HTTP 500.
+    with pytest.raises(ProgrammingError) as failure:
+        conn.cursor().execute(sql)
+    assert failure.value.errno == 1003
+    assert failure.value.sqlstate == "42000"
+
+
+def test_create_or_replace_schema(conn):
+    cur = conn.cursor()
+    cur.execute("create or replace schema staging")
+    assert cur.fetchone() == ("Schema STAGING successfully created.",)
+    cur.execute("create table t (id int)")
+
+    cur.execute("create or replace schema staging")
+    assert cur.fetchone() == ("Schema STAGING successfully created.",)
+    assert conn.schema == "STAGING"
+    with pytest.raises(ProgrammingError) as failure:  # the old contents are gone
+        cur.execute("select * from t")
+    assert failure.value.errno == 2003
+
+    with pytest.raises(ProgrammingError) as failure:
+        cur.execute("create schema staging")
+    assert failure.value.errno == 2002

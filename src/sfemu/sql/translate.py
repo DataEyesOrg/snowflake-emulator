@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sfemu import errors
@@ -17,7 +17,8 @@ def parse(sql: str) -> list[exp.Expression]:
     """Parse Snowflake SQL into statements with Snowflake identifier casing applied."""
     try:
         statements = sqlglot.parse(sql, read=SNOWFLAKE)
-    except ParseError as exc:
+    except (ParseError, TokenError) as exc:
+        # TokenError is the tokenizer's failure, e.g. an unterminated string.
         raise errors.syntax_error(_plain(str(exc))) from exc
     statements = [s for s in statements if s is not None]
     for statement in statements:

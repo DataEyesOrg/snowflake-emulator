@@ -6,10 +6,12 @@ import json
 import urllib.request
 from typing import Any
 
+import pytest
+
 from sfemu.testing import RunningServer
 
 
-def call(server: RunningServer, path: str, body: dict, token: str | None = None) -> dict[str, Any]:
+def call(server: RunningServer, path: str, body: Any, token: str | None = None) -> dict[str, Any]:
     request = urllib.request.Request(
         f"http://{server.host}:{server.port}{path}",
         data=json.dumps(body).encode(),
@@ -58,3 +60,35 @@ def test_token_renewal_needs_the_master_token(server):
 def test_heartbeat(server):
     session = login(server)
     assert call(server, "/session/heartbeat", {}, token=session["token"])["success"]
+
+
+@pytest.mark.parametrize(
+    ("bind", "code"),
+    [
+        ({"type": "FIXED", "value": "abc"}, "100038"),
+        ({"type": "REAL", "value": "abc"}, "100038"),
+        ({"type": "BOOLEAN", "value": "maybe"}, "100038"),
+        ("not an object", "390142"),
+    ],
+)
+def test_malformed_binds_are_errors_not_http_500(server, bind, code):
+    session = login(server)
+    query = {"sqlText": "select ?", "bindings": {"1": bind}}
+    reply = call(server, "/queries/v1/query-request", query, token=session["token"])
+    assert reply["success"] is False
+    assert reply["code"] == code
+
+
+def test_malformed_body_is_an_error_not_http_500(server):
+    session = login(server)
+    reply = call(server, "/queries/v1/query-request", [1, 2], token=session["token"])
+    assert reply["success"] is False
+    assert reply["code"] == "390142"
+
+
+def test_unexpected_failures_reach_the_driver_as_errors(server):
+    # "data" of the wrong type trips an AttributeError inside the handler; any
+    # such bug must come back in the envelope, since drivers retry on HTTP 500.
+    reply = call(server, "/session/v1/login-request", {"data": [1, 2]})
+    assert reply["success"] is False
+    assert reply["code"] == "000603"

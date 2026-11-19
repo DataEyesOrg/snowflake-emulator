@@ -85,6 +85,18 @@ def test_empty_arrow_result(arrow_conn):
     assert cur.execute("select * from e").description[0].name == "ID"
 
 
+def test_empty_arrow_result_in_pandas_and_batches(arrow_conn):
+    # Connectors 3.x / 4.x crash on a zero-row record batch, so an empty result
+    # must travel as an empty rowsetBase64, like on Snowflake.
+    cur = arrow_conn.cursor()
+    cur.execute("create table e (id int, name varchar)")
+    frame = cur.execute("select * from e").fetch_pandas_all()
+    assert frame.shape == (0, 2)
+    assert list(frame.columns) == ["ID", "NAME"]
+    batches = cur.execute("select * from e").get_result_batches()
+    assert sum(batch.rowcount for batch in batches) == 0
+
+
 def test_fetch_pandas_all(arrow_conn):
     cur = arrow_conn.cursor()
     cur.execute("create table events as select range id, 'e' || range name from range(1000)")

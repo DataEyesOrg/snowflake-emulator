@@ -61,13 +61,12 @@ docker compose up        # or: docker build -t sfemu . && docker run -p 8085:808
 ```
 
 Point drivers at `host: 127.0.0.1`, `port: 8085`, `protocol: http`. State is
-in memory; restarting the container resets the emulator. (The image is new
-and not yet exercised in CI.)
+in memory; restarting the container resets the emulator.
 
 ## What works
 
-Verified with `snowflake-connector-python` 5.2 (the test suite) and 3.15 / 4.8
-(by hand):
+Verified by the test suite with `snowflake-connector-python` 5.2, 3.15 and 4.8,
+and with Snowflake CLI 3.34:
 
 | Area | Supported |
 |---|---|

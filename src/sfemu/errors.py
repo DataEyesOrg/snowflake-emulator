@@ -34,6 +34,14 @@ def object_not_found(detail: str) -> SnowflakeError:
     return SnowflakeError("002003", "42S02", f"SQL compilation error:\n{detail}")
 
 
+def bad_request(detail: str) -> SnowflakeError:
+    return SnowflakeError("390142", "08004", f"Incoming request is malformed: {detail}")
+
+
+def internal(detail: str) -> SnowflakeError:
+    return SnowflakeError("000603", "XX000", f"SQL execution internal error:\n{detail}")
+
+
 def session_gone() -> SnowflakeError:
     return SnowflakeError(
         "390111", "08001", "Session no longer exists. New login required to access the service."

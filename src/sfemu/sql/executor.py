@@ -20,9 +20,9 @@ from sqlglot import exp
 
 from sfemu import errors
 from sfemu.arrow import ipc_stream, snowflake_table
-from sfemu.engine import DEFAULT_SCHEMA, Engine
+from sfemu.engine import DEFAULT_SCHEMA, Engine, quote
 from sfemu.errors import SnowflakeError
-from sfemu.session import Session
+from sfemu.session import DEFAULT_PARAMETERS, Session
 from sfemu.sql import translate
 from sfemu.types import Column, column_from_duckdb, encode_value, fixed_column, text_column
 
@@ -142,13 +142,12 @@ class Executor:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 table = snowflake_table(cursor.to_arrow_table(), columns)
+            if table.num_rows == 0:
+                # Snowflake sends an empty rowsetBase64 for an empty result and
+                # lets rowtype describe the columns. A zero-row record batch
+                # instead segfaults the 3.x / 4.x Python connectors in fetchall().
+                return QueryResult(columns, [], SELECT, total=0, arrow=b"")
             parts: list[pa.RecordBatch] = table.to_batches(max_chunksize=chunk_rows)
-            if not parts:  # an empty result still needs one, schema-carrying batch
-                parts = [
-                    pa.record_batch(
-                        [pa.array([], type=f.type) for f in table.schema], schema=table.schema
-                    )
-                ]
             arrow_chunks = [
                 ResultChunk(row_count=batch.num_rows, arrow=ipc_stream([batch]))
                 for batch in parts[1:]
@@ -212,7 +211,11 @@ class Executor:
             if self._engine.has_schema(database, name):
                 if if_not_exists:
                     return _status(f"{name} already exists, statement succeeded.", DDL)
-                raise _already_exists(name)
+                if not replace:
+                    raise _already_exists(name)
+                # Replacing a schema drops it together with its contents.
+                session.cursor.execute(f"DROP SCHEMA {quote(database)}.{quote(name)} CASCADE")
+            statement.set("replace", False)  # DuckDB has no CREATE OR REPLACE SCHEMA
             session.cursor.execute(translate.to_duckdb(statement))
             session.use(database, name)  # like CREATE DATABASE, this moves the session
             return _status(f"Schema {name} successfully created.", DDL)
@@ -276,10 +279,12 @@ class Executor:
     # Session state ---------------------------------------------------------
 
     def _use(self, session: Session, statement: exp.Use) -> QueryResult:
-        kind = statement.args.get("kind")
-        kind = kind.name.upper() if kind is not None else "SCHEMA"
         target = statement.this
         name = target.name
+        # A bare USE names a database, unless the name is qualified (db.schema).
+        kind = "SCHEMA" if target.db else "DATABASE"
+        if statement.args.get("kind") is not None:
+            kind = statement.args["kind"].name.upper()
         if kind == "DATABASE":
             if not self._engine.has_database(name):
                 raise _cannot_use()
@@ -303,7 +308,14 @@ class Executor:
             unset = bool(action.args.get("unset"))
             for item in action.expressions:
                 if unset:
-                    session.parameters.pop(item.this.name.upper(), None)
+                    # UNSET puts the parameter back to its default.
+                    name = item.this.name.upper()
+                    if name in DEFAULT_PARAMETERS:
+                        session.parameters[name] = DEFAULT_PARAMETERS[name]
+                    else:
+                        session.parameters.pop(name, None)
+                    if name == "TIMEZONE":
+                        session.cursor.execute("SET TimeZone = ?", [session.parameters[name]])
                     continue
                 assignment = item.this
                 name = assignment.this.name.upper()
@@ -381,25 +393,45 @@ def _bind_values(bindings: dict[str, Any] | None) -> list:
     """Turn the driver's positional (qmark) bindings into DuckDB parameters."""
     if not bindings:
         return []
+    if not isinstance(bindings, dict):
+        raise errors.bad_request("bindings must be an object")
     values = []
-    for position in sorted(bindings, key=int):
+    try:
+        positions = sorted(bindings, key=int)
+    except ValueError as exc:
+        raise errors.bad_request("binding positions must be numbers") from exc
+    for position in positions:
         binding = bindings[position]
+        if not isinstance(binding, dict):
+            raise errors.bad_request(f"binding {position} must be an object")
         kind, value = str(binding.get("type", "ANY")).upper(), binding.get("value")
         if value is None:
             values.append(None)
         elif isinstance(value, list):
             raise errors.unsupported("array bind")
-        elif kind == "FIXED":
-            values.append(int(value) if value.lstrip("-").isdigit() else Decimal(value))
-        elif kind == "REAL":
-            values.append(float(value))
-        elif kind == "BOOLEAN":
-            values.append(value.lower() == "true")
+        elif kind in ("FIXED", "REAL", "BOOLEAN"):
+            try:
+                values.append(_bind_scalar(kind, str(value)))
+            except (ValueError, ArithmeticError) as exc:
+                what = "Boolean" if kind == "BOOLEAN" else "Numeric"
+                raise SnowflakeError(
+                    "100038", "22018", f"{what} value '{value}' is not recognized"
+                ) from exc
         elif kind in ("TEXT", "ANY"):
             values.append(value)
         else:
             raise errors.unsupported(f"bind type {kind}")
     return values
+
+
+def _bind_scalar(kind: str, value: str) -> Any:
+    if kind == "FIXED":
+        return int(value) if value.lstrip("-").isdigit() else Decimal(value)
+    if kind == "REAL":
+        return float(value)
+    if value.lower() not in ("true", "false"):
+        raise ValueError(value)
+    return value.lower() == "true"
 
 
 def _already_exists(name: str) -> SnowflakeError:
