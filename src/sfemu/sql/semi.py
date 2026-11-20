@@ -38,7 +38,7 @@ RAW = "sf_raw"
 _FLATTEN = "sf_flatten"
 _MISSING: Any = object()
 
-_FLATTEN_COLUMNS = {
+FLATTEN_COLUMNS = {
     "SEQ": NUMBER,
     "KEY": TEXT,
     "PATH": TEXT,
@@ -232,6 +232,15 @@ def rewrite(statement: exp.Expression, lookup: Lookup | None = None) -> list[str
     return rewriter.projections(statement)
 
 
+def output_kinds(
+    query: exp.Expression, names: list[str], lookup: Lookup | None = None
+) -> dict[str, str | None]:
+    """The kinds of the result columns of these names, a star in the query included."""
+    rewriter = _Rewriter(lookup)
+    found = {name: rewriter._output(query, name) for name in names}
+    return {name: None if kind is _MISSING else kind for name, kind in found.items()}
+
+
 def _json() -> exp.DataType:
     return exp.DataType.build("JSON", dialect="duckdb")
 
@@ -386,7 +395,7 @@ class _Rewriter:
     def _find(self, holder: exp.Expression, table: str, name: str) -> Any:
         """The kind of a column among the FROM items of a statement; _MISSING if not there."""
         unsure = False
-        for source in _sources(holder):
+        for source in sources(holder):
             if table and source.alias_or_name != table:
                 continue
             found = self._source_column(source, name)
@@ -398,12 +407,12 @@ class _Rewriter:
 
     def _source_column(self, source: exp.Expression, name: str) -> Any:
         if source.meta.get(_FLATTEN) or isinstance(source.this, exp.Explode):
-            return _FLATTEN_COLUMNS.get(name, _MISSING)
+            return FLATTEN_COLUMNS.get(name, _MISSING)
         if isinstance(source, exp.Subquery):
             return self._output(source.this, name)
         if not isinstance(source, exp.Table) or not isinstance(source.this, exp.Identifier):
             return None
-        definition = None if source.db else _cte(source, source.name)
+        definition = None if source.db else cte(source, source.name)
         if definition is not None:
             return self._output(definition, name)
         columns = self._table(source)
@@ -601,7 +610,8 @@ class _Rewriter:
         swap(node, build)
 
     def _star_map(self, node: exp.StarMap) -> None:
-        raise errors.unsupported("OBJECT_CONSTRUCT(*)")
+        # sfemu.sql.positional writes the columns out; what is left has no FROM.
+        raise errors.unsupported("OBJECT_CONSTRUCT(*) outside a SELECT")
 
     def _array(self, node: exp.Expression) -> None:
         items = node.expressions
@@ -761,9 +771,9 @@ class _Rewriter:
         unknown = set(options) - {"INPUT", "PATH", "OUTER", "RECURSIVE", "MODE"}
         if unknown or "INPUT" not in options:
             raise errors.syntax_error("FLATTEN takes INPUT, PATH, OUTER, RECURSIVE and MODE.")
-        mode = options.get("MODE")
-        if mode is not None and mode.name.upper() != "BOTH":
-            raise errors.unsupported(f"FLATTEN with MODE => '{mode.name.upper()}'")
+        mode = options["MODE"].name.upper() if "MODE" in options else "BOTH"
+        if mode not in ("OBJECT", "ARRAY", "BOTH"):
+            raise errors.syntax_error("FLATTEN takes OBJECT, ARRAY or BOTH as its MODE.")
         self._done.add(id(holder))
 
         def build() -> exp.Expression:
@@ -773,6 +783,7 @@ class _Rewriter:
                 options.get("PATH") or exp.Null(),
                 options.get("OUTER") or exp.false(),
                 options.get("RECURSIVE") or exp.false(),
+                exp.Literal.string(mode),
                 kind=None,
             )
             table = exp.Table(this=flattened)
@@ -838,7 +849,7 @@ def _is_raw(node: exp.Expression) -> bool:
     return bool(node.meta.get(RAW))
 
 
-def _sources(holder: exp.Expression) -> list[exp.Expression]:
+def sources(holder: exp.Expression) -> list[exp.Expression]:
     """The FROM items a column of this statement may come from."""
     found = []
     if isinstance(holder, exp.Select):
@@ -853,7 +864,7 @@ def _sources(holder: exp.Expression) -> list[exp.Expression]:
     return [source for source in found if isinstance(source, exp.Expression)]
 
 
-def _cte(node: exp.Expression, name: str) -> exp.Expression | None:
+def cte(node: exp.Expression, name: str) -> exp.Expression | None:
     """The query of the CTE of this name that is in scope at a node."""
     holder: exp.Expression | None = node
     while holder is not None:

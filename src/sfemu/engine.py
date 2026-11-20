@@ -58,6 +58,9 @@ class Engine:
         # them, so they are kept here and never reach DuckDB, which would
         # enforce them.
         self.constraints: dict[TableKey, list[Constraint]] = {}
+        # The columns that are an ARRAY or an OBJECT, by table or view. DuckDB
+        # holds both as JSON, like a VARIANT, so which it is is kept here.
+        self.semi_types: dict[TableKey, dict[str, str]] = {}
 
     def primary_key(self, table: TableKey) -> Constraint | None:
         return next((c for c in self.constraints.get(table, []) if c.kind == PRIMARY_KEY), None)
@@ -76,17 +79,38 @@ class Engine:
         else:
             kept[:] = [c for c in kept if c.name != name]
 
+    def set_semi_types(self, table: TableKey, types: dict[str, str]) -> None:
+        """Replace what is known of a relation's ARRAY and OBJECT columns."""
+        if types:
+            self.semi_types[table] = dict(types)
+        else:
+            self.semi_types.pop(table, None)
+
+    def drop_column(self, table: TableKey, name: str) -> None:
+        self.semi_types.get(table, {}).pop(name, None)
+
+    def forget(self, table: TableKey) -> None:
+        """A table or view is gone, and what is kept about it goes with it."""
+        self.constraints.pop(table, None)
+        self.semi_types.pop(table, None)
+
     def move_constraints(self, old: TableKey, new: TableKey) -> None:
-        """A table was renamed: its constraints follow, and so do foreign keys to it."""
+        """A table was renamed: what is kept about it follows, and so do foreign keys to it."""
         moved = self.constraints.pop(old, None)
         if moved:
             self.constraints[new] = moved
+        types = self.semi_types.pop(old, None)
+        if types:
+            self.semi_types[new] = types
         for constraints in self.constraints.values():
             for constraint in constraints:
                 if constraint.references == old:
                     constraint.references = new
 
     def rename_column(self, table: TableKey, old: str, new: str) -> None:
+        types = self.semi_types.get(table, {})
+        if old in types:
+            types[new] = types.pop(old)
         for key, constraints in self.constraints.items():
             for constraint in constraints:
                 if key == table:

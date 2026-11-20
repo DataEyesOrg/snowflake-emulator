@@ -299,3 +299,54 @@ select array_construct(1, 'two', array_construct(3), object_construct('four', 4)
 
 select json_extract_path_text(v, 'addr.city'), get_path(v, 'tags[1]')::string from ev where id = 1;
 --> [["Oslo", "b"]]
+
+select object_construct(*) from ev where id = 2;
+--> [[{"ID": 2, "V": {"addr": {"city": "Rome"}, "n": 2, "name": "bob", "tags": []}}]]
+
+select object_construct(*) from (select id, v:name::string name, v:nickname nick from ev where id < 3) order by 1;
+--> [[{"ID": 1, "NAME": "ann"}], [{"ID": 2, "NAME": "bob"}]]
+
+select object_construct(e.*) from ev e join (select 3 three) o on e.id = o.three;
+--> [[{"ID": 3}]]
+
+select object_construct(* exclude (v)) from ev order by id;
+--> [[{"ID": 1}], [{"ID": 2}], [{"ID": 3}]]
+
+select f.key, f.index, f.value from ev, lateral flatten(input => v, mode => 'OBJECT') f where id = 2 order by f.key;
+--> [["addr", null, {"city": "Rome"}], ["n", null, 2], ["name", null, "bob"], ["tags", null, []]]
+
+select count(*) from ev, lateral flatten(input => v, mode => 'ARRAY') f;
+--> [[0]]
+
+select f.index, f.value from ev, lateral flatten(input => v:tags, mode => 'ARRAY') f where id = 1 order by f.index;
+--> [[0, "a"], [1, "b"]]
+
+select count(*) from ev, lateral flatten(input => v:tags, mode => 'OBJECT') f;
+--> [[0]]
+
+select f.path from ev, lateral flatten(input => v, recursive => true, mode => 'OBJECT') f where id = 1 order by f.path;
+--> [["addr"], ["addr.city"], ["addr.zip"], ["n"], ["name"], ["tags"]]
+
+select column1, column2 from values (1, 'a'), (2, 'b') order by column1 desc;
+--> [[2, "b"], [1, "a"]]
+
+select $2, $1 from values (1, 'a'), (2, 'b') order by $1;
+--> [["a", 1], ["b", 2]]
+
+select v.$1 + 1, v.column2 from (values (1, 'a'), (2, 'b')) v where v.$1 > 1;
+--> [[3, "b"]]
+
+select $1, e.$2:name::string from ev e where $1 = 1;
+--> [[1, "ann"]]
+
+select $1 from (select id * 10, v from ev) order by $1;
+--> [[10], [20], [30]]
+
+with c as (select v:name::string name, id from ev where id < 3) select $2, c.$1 from c order by $2;
+--> [[1, "ann"], [2, "bob"]]
+
+select a.$1, b.$1 from (values (1), (2)) a join (values (2), (3)) b on a.$1 = b.$1;
+--> [[2, 2]]
+
+select parse_json(column1):k from values ('{"k": 1}'), ('{"k": [2]}') order by 1;
+--> [[1], [[2]]]

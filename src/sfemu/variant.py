@@ -311,7 +311,7 @@ _MACROS: list[tuple[str, str, str]] = [
 # columns Snowflake names. json_tree numbers the root 0, so its children are
 # the rows whose parent is 0; a recursive FLATTEN takes all the descendants.
 _FLATTEN = f"""
-CREATE OR REPLACE MACRO {_S}.sf_flatten(input, path, is_outer, is_recursive) AS TABLE
+CREATE OR REPLACE MACRO {_S}.sf_flatten(input, path, is_outer, is_recursive, mode) AS TABLE
 WITH source AS (
     SELECT CASE WHEN coalesce(path, '') = '' THEN input
                 ELSE json_extract(input, '$.' || path) END AS root,
@@ -330,6 +330,8 @@ LEFT JOIN LATERAL (
     SELECT * FROM json_tree(source.root) AS node
     WHERE json_type(source.root) IN ('ARRAY', 'OBJECT')
       AND (node.parent = 0 OR (is_recursive AND node.parent IS NOT NULL))
+      AND (mode = 'BOTH' OR (json_type(source.root) = mode
+                             AND (mode = 'ARRAY') = (node.fullkey LIKE '%]')))
 ) AS item ON TRUE
 WHERE is_outer OR item.id IS NOT NULL
 ORDER BY item.id

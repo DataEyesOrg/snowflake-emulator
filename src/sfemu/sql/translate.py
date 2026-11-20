@@ -8,7 +8,7 @@ from sqlglot.errors import ParseError, TokenError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sfemu import errors
-from sfemu.sql import dates, semi
+from sfemu.sql import dates, positional, semi
 
 SNOWFLAKE = "snowflake"
 DUCKDB = "duckdb"
@@ -72,6 +72,7 @@ def compile(
     ``lookup`` tells the kinds of a table's columns; see :mod:`sfemu.sql.semi`.
     """
     statement = statement.copy()  # keep Snowflake's types in the caller's tree
+    positional.rewrite(statement, lookup)
     kinds = semi.rewrite(statement, lookup)
     for data_type in list(statement.find_all(exp.DataType)):
         if data_type.this in _INTEGER_TYPES:
@@ -92,6 +93,15 @@ def compile(
                 prop.pop()
     # Every identifier is quoted so DuckDB stores the case Snowflake would.
     return statement.sql(dialect=DUCKDB, identify=True), kinds
+
+
+def output_kinds(
+    query: exp.Expression, names: list[str], lookup: semi.Lookup | None = None
+) -> dict[str, str | None]:
+    """The kinds of the named result columns of a query: see :mod:`sfemu.sql.semi`."""
+    query = query.copy()
+    positional.rewrite(query, lookup)
+    return semi.output_kinds(query, names, lookup)
 
 
 def bind_count(statement: exp.Expression) -> int:
@@ -168,9 +178,15 @@ def name_projections(statement: exp.Expression) -> None:
     if not isinstance(select, exp.Select):
         return
     for projection in list(select.expressions):
-        if isinstance(projection, exp.Alias | exp.Column | exp.Star) or projection.is_star:
+        positional = isinstance(projection, exp.Column) and isinstance(
+            projection.this, exp.Parameter
+        )
+        if not positional and (
+            isinstance(projection, exp.Alias | exp.Column | exp.Star) or projection.is_star
+        ):
             continue
-        name = projection.sql(dialect=SNOWFLAKE).upper()
+        # t.$2 is named $2: the column it stands for is only found out later.
+        name = (projection.this if positional else projection).sql(dialect=SNOWFLAKE).upper()
         projection.replace(exp.alias_(projection.copy(), exp.to_identifier(name, quoted=True)))
 
 

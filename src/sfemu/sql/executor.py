@@ -8,6 +8,7 @@ DuckDB, so a statement never passes locally by accident.
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as dt
 import threading
 import uuid
@@ -532,6 +533,68 @@ class Executor:
         session.cursor.execute(sql, params)
         return kinds
 
+    def _clone(
+        self, session: Session, source: exp.Table, key: tuple[str, str, str], replaced: bool
+    ) -> None:
+        """CREATE TABLE ... CLONE: a copy of the table, its rows and what is kept about it."""
+        if self._kind(session, source) != "TABLE":
+            raise errors.object_not_found(
+                f"Table '{source.name}' does not exist or not authorized."
+            )
+        origin = _qualify(session, source)
+        if origin == key:
+            raise errors.unsupported("CREATE OR REPLACE TABLE ... CLONE of the table itself")
+        if origin[0] != key[0]:
+            # DuckDB cannot write to two databases in one transaction.
+            raise errors.unsupported("CREATE TABLE ... CLONE from another database")
+        engine = self._engine
+        with _atomic(session):
+            if replaced:
+                session.cursor.execute(f"DROP TABLE {'.'.join(quote(part) for part in key)}")
+            self._copy(session, "TABLE", origin, key)
+        engine.forget(key)
+        engine.set_semi_types(key, engine.semi_types.get(origin, {}))
+        for constraint in engine.constraints.get(origin, []):
+            engine.add_constraint(key, copy.deepcopy(constraint))
+
+    def _semi_types(
+        self, session: Session, statement: exp.Create, key: tuple[str, str, str]
+    ) -> dict[str, str]:
+        """Which columns of a relation just created are an ARRAY or an OBJECT."""
+        found: dict[str, str] = {}
+        if isinstance(statement.this, exp.Schema):
+            for column in statement.this.expressions:
+                if isinstance(column, exp.ColumnDef) and column.kind is not None:
+                    found[column.name] = semi.type_kind(column.kind)
+        like = statement.find(exp.LikeProperty)
+        if like is not None and isinstance(like.this, exp.Table):
+            found.update(self._engine.semi_types.get(_qualify(session, like.this), {}))
+        query = statement.expression
+        renamed = [
+            column.name
+            for column in (statement.this.expressions if found == {} else [])
+            if isinstance(statement.this, exp.Schema) and isinstance(column, exp.Identifier)
+        ]
+        if isinstance(query, exp.Query) and renamed:
+            # CREATE ... (x, y) AS SELECT: the columns are the query's, in order.
+            kinds = translate.compile(query, self._lookup(session))[1] or []
+            if len(kinds) == len(renamed):
+                found.update(zip(renamed, kinds, strict=True))
+        elif isinstance(query, exp.Query):
+            # CREATE ... AS SELECT: the kinds of the query's columns, by name.
+            names = [
+                name
+                for (name,) in session.cursor.execute(
+                    "SELECT column_name FROM duckdb_columns() WHERE database_name = ? "
+                    "AND schema_name = ? AND table_name = ? AND data_type = 'JSON'",
+                    list(key),
+                ).fetchall()
+                if name not in found
+            ]
+            if names:
+                found.update(translate.output_kinds(query, names, self._lookup(session)))
+        return {name: kind for name, kind in found.items() if kind in (semi.ARRAY, semi.OBJECT)}
+
     def _lookup(self, session: Session) -> semi.Lookup:
         """How the SQL rewrites learn the kinds of a table's columns: from the catalog."""
 
@@ -541,10 +604,15 @@ class Executor:
                 return None
             found = session.cursor.execute(
                 "SELECT column_name, data_type FROM duckdb_columns() "
-                "WHERE database_name = ? AND schema_name = ? AND table_name = ?",
+                "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+                "ORDER BY column_index",
                 [database, schema, name],
             ).fetchall()
-            return {column: _column_kind(data_type) for column, data_type in found} or None
+            kinds = {column: _column_kind(data_type) for column, data_type in found}
+            for column, kind in self._engine.semi_types.get((database, schema, name), {}).items():
+                if kinds.get(column) == semi.VARIANT:
+                    kinds[column] = kind
+            return kinds or None
 
         return columns
 
@@ -564,7 +632,9 @@ class Executor:
                     f"Object '{table.name}' does not exist or not authorized."
                 )
         # Both replace what they find with DuckDB names the checks would reject.
-        metadata.expand_information_schema(statement, session.database, self._engine.started)
+        metadata.expand_information_schema(
+            statement, session.database, self._engine.started, self._engine.semi_types
+        )
         self._expand_result_scans(session, statement)
 
     def _expand_result_scans(self, session: Session, statement: exp.Expression) -> None:
@@ -652,6 +722,25 @@ class Executor:
         kinds = self._run(session, statement, params)
         cursor = session.cursor
         columns = [column_from_duckdb(d[0], d[1]) for d in cursor.description]
+        types = [str(d[1]) for d in cursor.description]
+        chunk_rows = _chunk_rows(session)
+        as_arrow = _result_format(session) == ARROW
+        # The result is taken off the cursor first: working out the kinds of
+        # the columns below may query the catalog on the same cursor.
+        if as_arrow:
+            # Arrow output on a DB-API result copies once more than the
+            # relational API would; that copy is the price of parameters.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                raw = cursor.to_arrow_table()
+        else:
+            fetched = cursor.fetchall()
+        if kinds is None and any(column.type == "variant" for column in columns):
+            # A star: the kinds are found by the names the columns came out under.
+            named = translate.output_kinds(
+                statement, [column.name for column in columns], self._lookup(session)
+            )
+            kinds = [named[column.name] for column in columns]
         if kinds is not None and len(kinds) == len(columns):
             # DuckDB holds every semi-structured value as JSON; whether a
             # column is an ARRAY or an OBJECT is known from the statement.
@@ -661,14 +750,9 @@ class Executor:
                 else column
                 for column, kind in zip(columns, kinds, strict=True)
             ]
-        types = [str(d[1]) for d in cursor.description]
-        chunk_rows = _chunk_rows(session)
-        if _result_format(session) == ARROW:
-            # Arrow output on a DB-API result copies once more than the
-            # relational API would; that copy is the price of parameters.
+        if as_arrow:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                raw = cursor.to_arrow_table()
                 table = snowflake_table(raw, columns)
             if table.num_rows == 0:
                 # Snowflake sends an empty rowsetBase64 for an empty result and
@@ -690,7 +774,6 @@ class Executor:
                 source=raw,
                 types=types,
             )
-        fetched = cursor.fetchall()
         rows = [
             [encode_value(value, column) for value, column in zip(row, columns, strict=True)]
             for row in fetched
@@ -731,6 +814,9 @@ class Executor:
         target = statement.this.this if isinstance(statement.this, exp.Schema) else statement.this
         if_not_exists = bool(statement.args.get("exists"))
         replace = bool(statement.args.get("replace"))
+        clone = statement.args.get("clone")
+        if clone is not None and kind != "TABLE":
+            raise errors.unsupported(f"CREATE {kind} ... CLONE")
 
         if kind == "DATABASE":
             name = target.name
@@ -786,9 +872,13 @@ class Executor:
                         resolved = _qualify(session, table)
                         table.set("catalog", exp.to_identifier(resolved[0], quoted=True))
                         table.set("db", exp.to_identifier(resolved[1], quoted=True))
-            self._run(session, statement, params, creating=target)
             key = (database, schema, name)
-            self._engine.constraints.pop(key, None)
+            if clone is not None:
+                self._clone(session, clone.this, key, replaced=bool(found))
+            else:
+                self._run(session, statement, params, creating=target)
+                self._engine.forget(key)
+                self._engine.set_semi_types(key, self._semi_types(session, statement, key))
             for constraint in constraints:
                 self._engine.add_constraint(key, constraint)
             if temporary:
@@ -830,7 +920,7 @@ class Executor:
                 statement.set("cascade", False)
                 session.cursor.execute(translate.to_duckdb(statement))
                 session.temporary_tables.discard(_qualify(session, target))
-                self._engine.constraints.pop(_qualify(session, target), None)
+                self._engine.forget(_qualify(session, target))
         else:
             raise errors.unsupported(f"DROP {kind}")
 
@@ -900,6 +990,13 @@ class Executor:
                 if isinstance(action, exp.ColumnDef):
                     for constraint in _pop_column_constraints(action, qualify):
                         steps.append(partial(engine.add_constraint, key, constraint))
+                    declared = semi.type_kind(action.kind) if action.kind is not None else None
+                    if declared in (semi.ARRAY, semi.OBJECT):
+                        added = {**engine.semi_types.get(key, {}), action.name: declared}
+                        steps.append(partial(engine.set_semi_types, key, added))
+                if isinstance(action, exp.Drop):
+                    for dropped in action.args.get("tables") or []:
+                        steps.append(partial(engine.drop_column, key, dropped.name))
                 single = exp.Alter(this=target.copy(), kind=kind, actions=[action.copy()])
                 translate.check_supported(single)
                 steps.append(partial(cursor.execute, translate.to_duckdb(single)))
@@ -923,7 +1020,6 @@ class Executor:
         """Rename a table or view, moving it to another schema if the new name says so."""
         cursor = session.cursor
         old_name = ".".join(quote(part) for part in old)
-        new_name = ".".join(quote(part) for part in new)
         if old[:2] == new[:2]:
             cursor.execute(f"ALTER {kind} {old_name} RENAME TO {quote(new[2])}")
         elif old[0] != new[0]:
@@ -936,34 +1032,47 @@ class Executor:
                 raise errors.object_not_found(
                     f"Schema '{new[1]}' does not exist or not authorized."
                 )
-            source, column = ("duckdb_tables()", "table_name")
-            if kind == "VIEW":
-                source, column = ("duckdb_views()", "view_name")
-            where = f"database_name = ? AND schema_name = ? AND {column} = ?"
-            definition, comment = cursor.execute(
-                f"SELECT sql, comment FROM {source} WHERE {where}", list(old)
-            ).fetchone()
-            create = sqlglot.parse_one(definition, read=translate.DUCKDB)
-            target = create.this.this if isinstance(create.this, exp.Schema) else create.this
-            target.replace(exp.table_(new[2], db=new[1], catalog=new[0], quoted=True))
-            cursor.execute(create.sql(dialect=translate.DUCKDB, identify=True))
-            if kind == "TABLE":
-                cursor.execute(f"INSERT INTO {new_name} SELECT * FROM {old_name}")
-            if comment:
-                cursor.execute(_comment_sql(kind, new_name, comment))
-            comments = cursor.execute(
-                "SELECT column_name, comment FROM duckdb_columns() "
-                "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
-                "AND comment IS NOT NULL",
-                list(old),
-            ).fetchall()
-            for column_name, text in comments:
-                cursor.execute(_comment_sql("COLUMN", f"{new_name}.{quote(column_name)}", text))
+            self._copy(session, kind, old, new)
             cursor.execute(f"DROP {kind} {old_name}")
         if old in session.temporary_tables:
             session.temporary_tables.discard(old)
             session.temporary_tables.add(new)
         self._engine.move_constraints(old, new)
+
+    def _copy(
+        self,
+        session: Session,
+        kind: str,
+        old: tuple[str, str, str],
+        new: tuple[str, str, str],
+    ) -> None:
+        """Create a table or view from the definition of another, rows and comments included."""
+        cursor = session.cursor
+        old_name = ".".join(quote(part) for part in old)
+        new_name = ".".join(quote(part) for part in new)
+        source, column = ("duckdb_tables()", "table_name")
+        if kind == "VIEW":
+            source, column = ("duckdb_views()", "view_name")
+        where = f"database_name = ? AND schema_name = ? AND {column} = ?"
+        definition, comment = cursor.execute(
+            f"SELECT sql, comment FROM {source} WHERE {where}", list(old)
+        ).fetchone()
+        create = sqlglot.parse_one(definition, read=translate.DUCKDB)
+        target = create.this.this if isinstance(create.this, exp.Schema) else create.this
+        target.replace(exp.table_(new[2], db=new[1], catalog=new[0], quoted=True))
+        cursor.execute(create.sql(dialect=translate.DUCKDB, identify=True))
+        if kind == "TABLE":
+            cursor.execute(f"INSERT INTO {new_name} SELECT * FROM {old_name}")
+        if comment:
+            cursor.execute(_comment_sql(kind, new_name, comment))
+        comments = cursor.execute(
+            "SELECT column_name, comment FROM duckdb_columns() "
+            "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+            "AND comment IS NOT NULL",
+            list(old),
+        ).fetchall()
+        for column_name, text in comments:
+            cursor.execute(_comment_sql("COLUMN", f"{new_name}.{quote(column_name)}", text))
 
     def _alter_column_comments(self, session: Session, sql: str) -> QueryResult:
         """ALTER TABLE t ALTER [COLUMN] a COMMENT '..', b COMMENT '..' — dbt's persist_docs."""
@@ -1078,6 +1187,7 @@ class Executor:
             schema=session.schema,
             started=self._engine.started,
             constraints=self._engine.constraints,
+            semi_types=self._engine.semi_types,
         )
         return _rows_result(columns, rows)
 
@@ -1107,7 +1217,9 @@ class Executor:
             label = _RELATION_KINDS[kind]
             raise errors.object_not_found(f"{label} '{name}' does not exist or not authorized.")
         constraints = self._engine.constraints.get((database, schema, name), [])
-        described = metadata.describe(session.cursor, database, schema, name, constraints)
+        described = metadata.describe(
+            session.cursor, database, schema, name, constraints, self._engine.semi_types
+        )
         return _rows_result(*described)
 
     def _drop_database(self, session: Session, name: str) -> None:

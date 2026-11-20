@@ -74,12 +74,12 @@ append) models.
 | Area | Supported |
 |---|---|
 | Protocol | login, query, logout; JSON and Arrow result formats; multi-statement requests (`num_statements`, `MULTI_STATEMENT_COUNT`); results and status of a recent query by its id |
-| Queries | `SELECT` and set operations, translated by sqlglot; `RESULT_SCAN` and `LAST_QUERY_ID` over the results of recent statements |
-| Semi-structured | `VARIANT`, `OBJECT` and `ARRAY` columns and values; paths (`v:a.b[0]`, `v['a']`, `GET`, `GET_PATH`); `PARSE_JSON`, `TRY_PARSE_JSON`, `CHECK_JSON`, `TO_VARIANT`, `TO_JSON`, `TO_ARRAY`; `OBJECT_CONSTRUCT` (also `_KEEP_NULL`), `OBJECT_INSERT` / `DELETE` / `PICK` / `KEYS`, `OBJECT_AGG`; `ARRAY_CONSTRUCT`, `ARRAY_AGG` and the `ARRAY_*` functions; `FLATTEN` with `PATH`, `OUTER` and `RECURSIVE`; `TYPEOF`, `IS_*`, `AS_*`; the implicit conversion of a `VARIANT` compared with or used as a typed value |
+| Queries | `SELECT` and set operations, translated by sqlglot; columns by position (`$1`, `t.$2`) and `COLUMN1` ... of a `VALUES` clause; `RESULT_SCAN` and `LAST_QUERY_ID` over the results of recent statements |
+| Semi-structured | `VARIANT`, `OBJECT` and `ARRAY` columns and values; paths (`v:a.b[0]`, `v['a']`, `GET`, `GET_PATH`); `PARSE_JSON`, `TRY_PARSE_JSON`, `CHECK_JSON`, `TO_VARIANT`, `TO_JSON`, `TO_ARRAY`; `OBJECT_CONSTRUCT` (also `_KEEP_NULL` and `OBJECT_CONSTRUCT(*)`), `OBJECT_INSERT` / `DELETE` / `PICK` / `KEYS`, `OBJECT_AGG`; `ARRAY_CONSTRUCT`, `ARRAY_AGG` and the `ARRAY_*` functions; `FLATTEN` with `PATH`, `OUTER`, `RECURSIVE` and `MODE`; `TYPEOF`, `IS_*`, `AS_*`; the implicit conversion of a `VARIANT` compared with or used as a typed value |
 | Conversion | `TRY_CAST`, `TRY_TO_NUMBER` / `DECIMAL` / `DOUBLE` / `BOOLEAN` / `DATE` / `TIME` / `TIMESTAMP*` and their `TO_*` forms; `TO_TIMESTAMP` of text, of an epoch number and of a string of digits |
 | Dates and times | `DATEADD`, `DATEDIFF`, `DATE_TRUNC`, `LAST_DAY`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `NEXT_DAY`, `*_FROM_PARTS`, `EXTRACT` and the `YEAR` ... `DAYOFWEEKISO` family, `INTERVAL` arithmetic, with a `DATE` staying a `DATE`; `TO_CHAR` and `TO_DATE` / `TO_TIME` / `TO_TIMESTAMP` with format models; `CONVERT_TIMEZONE`; timestamps as text in Snowflake's default formats |
 | DML | `INSERT`, `INSERT OVERWRITE`, `UPDATE`, `DELETE`, `MERGE`, with Snowflake's row-count result sets |
-| DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, also into another schema; `SWAP WITH`; add / drop / rename / retype column; primary keys; comments); `COMMENT ON` |
+| DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary, `LIKE` and `CLONE`), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, also into another schema; `SWAP WITH`; add / drop / rename / retype column; primary keys; comments); `COMMENT ON` |
 | Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`), columns, primary, unique and imported keys, session parameters; `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
 | Access control | none: `GRANT` and `REVOKE` are accepted and ignored, `SHOW GRANTS` is empty |
 | Session | `USE`, `ALTER SESSION`, login session parameters, `BEGIN` / `COMMIT` / `ROLLBACK`, `CURRENT_*()` |
@@ -165,10 +165,15 @@ Dates and conversions:
 
 Semi-structured data:
 
-- `VARIANT`, `OBJECT` and `ARRAY` are stored alike, so `DESCRIBE`, `SHOW
-  COLUMNS` and `INFORMATION_SCHEMA` report all three as `VARIANT`. A result
-  column is typed `ARRAY` or `OBJECT` when the query itself shows it to be
-  one (`ARRAY_CONSTRUCT(...)`, `OBJECT_CONSTRUCT(...)`), else `VARIANT`.
+- `VARIANT`, `OBJECT` and `ARRAY` are stored alike. Which of them a column
+  is is recorded when it is declared and followed into `CREATE TABLE AS`,
+  views, `LIKE` and `CLONE`, so `DESCRIBE`, `SHOW COLUMNS`,
+  `INFORMATION_SCHEMA` and the types of a result tell them apart. Where it
+  cannot be followed (a view with a column list over `SELECT *`) the column
+  is reported as `VARIANT`. Nothing checks the values: an `OBJECT` can be
+  inserted into an `ARRAY` column.
+- Structured types (`ARRAY(NUMBER)`, `OBJECT(a INT)`, `MAP(...)`) are
+  accepted and kept as a plain `ARRAY` or `OBJECT`.
 - Arithmetic, `SUM` and `AVG` on a `VARIANT` give a `FLOAT`. `MIN` and `MAX`
   of a `VARIANT` compare the values as text.
 - A value put into a `VARIANT` keeps no type of its own beyond JSON's: a date
@@ -182,8 +187,10 @@ Semi-structured data:
   compares wrongly.
 - An unaliased path is named after sqlglot's rendering (`GET_PATH(V, 'a')`),
   where Snowflake names it `V:a`.
-- Not supported: `OBJECT_CONSTRUCT(*)`, `FLATTEN` with a `MODE`, structured
-  types (`ARRAY(NUMBER)`, `OBJECT(a INT)`, `MAP`).
+- `$1` works in a `SELECT`, for a table, view, CTE, subquery, `VALUES` or
+  `FLATTEN`; not in `UPDATE` or `DELETE`.
+- `CREATE TABLE ... CLONE` copies the rows; `CLONE` of a schema or database,
+  and of a table in another database, is not supported.
 
 ## Development
 

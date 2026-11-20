@@ -27,6 +27,8 @@ OWNER = "SYSADMIN"
 INFORMATION_SCHEMA = "INFORMATION_SCHEMA"
 
 Rows = tuple[list[Column], list[list[Any]]]
+# The ARRAY and OBJECT columns of each table and view: see Engine.semi_types.
+SemiTypes = dict[TableKey, dict[str, str]]
 
 _USER_DATABASE = "database_name NOT IN ({})".format(", ".join(f"'{d}'" for d in INTERNAL_DATABASES))
 _USER_SCHEMA = f"NOT internal AND schema_name <> 'main' AND {_USER_DATABASE}"
@@ -90,6 +92,7 @@ def show(
     schema: str | None,
     started: dt.datetime,
     constraints: dict[TableKey, list[Constraint]],
+    semi_types: SemiTypes,
 ) -> Rows:
     """Answer a SHOW command for a session whose current namespace is given."""
     what = str(statement.name).upper()
@@ -105,7 +108,7 @@ def show(
     elif what in ("COLUMNS", *_KEY_KINDS, "IMPORTED KEYS"):
         scope = _table_scope(cursor, statement, database, schema)
         if what == "COLUMNS":
-            return _show_columns(cursor, scope)
+            return _show_columns(cursor, scope, semi_types)
         if what == "IMPORTED KEYS":
             return _show_imported_keys(cursor, scope, constraints, started)
         return _show_keys(cursor, scope, constraints, started, _KEY_KINDS[what])
@@ -138,14 +141,16 @@ def _table_scope(
 
 
 def _show_columns(
-    cursor: duckdb.DuckDBPyConnection, scope: tuple[str | None, str | None, str | None]
+    cursor: duckdb.DuckDBPyConnection,
+    scope: tuple[str | None, str | None, str | None],
+    semi_types: SemiTypes,
 ) -> Rows:
     where, params = _where(scope[0], scope[1])
     if scope[2] is not None:
         where, params = f"{where} AND table_name = ?", [*params, scope[2]]
     found = _select(
         cursor,
-        _COLUMNS_SQL,
+        _columns_sql(semi_types),
         where,
         params,
         order="database_name, schema_name, table_name, column_index",
@@ -173,6 +178,29 @@ def _show_columns(
              precision, scale) in found
     ]  # fmt: skip
     return columns, rows
+
+
+def _columns_sql(semi_types: SemiTypes) -> str:
+    """The columns of every relation, an ARRAY or OBJECT column named as one."""
+    known = [
+        (*table, column, kind)
+        for table, columns in semi_types.items()
+        for column, kind in columns.items()
+    ]
+    if not known:
+        return _COLUMNS_SQL
+    rows = ", ".join("(" + ", ".join(_literal(value) for value in row) + ")" for row in known)
+    return f"""
+SELECT c.* REPLACE (CASE WHEN c.type_name = 'VARIANT' THEN coalesce(k.kind, 'VARIANT')
+                         ELSE c.type_name END AS type_name)
+FROM ({_COLUMNS_SQL}) AS c
+LEFT JOIN (VALUES {rows}) AS k(database_name, schema_name, table_name, column_name, kind)
+  USING (database_name, schema_name, table_name, column_name)
+"""
+
+
+def _literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
 
 
 # The "type" SHOW COLUMNS puts in its data_type JSON, where it differs.
@@ -485,13 +513,14 @@ def describe(
     schema: str,
     name: str,
     constraints: list[Constraint],
+    semi_types: SemiTypes,
 ) -> Rows:
     """DESCRIBE TABLE or VIEW; the relation is known to exist."""
     primary_key = {c for k in constraints if k.kind == PRIMARY_KEY for c in k.columns}
     unique = {c for k in constraints if k.kind == UNIQUE for c in k.columns}
     found = _select(
         cursor,
-        _COLUMNS_SQL,
+        _columns_sql(semi_types),
         "database_name = ? AND schema_name = ? AND table_name = ?",
         [database, schema, name],
         order="column_index",
@@ -537,7 +566,9 @@ def _full_type(name: str, precision: int, scale: int) -> str:
 # INFORMATION_SCHEMA ---------------------------------------------------------
 
 
-def _information_schema_views(database: str, started: dt.datetime) -> dict[str, str]:
+def _information_schema_views(
+    database: str, started: dt.datetime, semi_types: SemiTypes
+) -> dict[str, str]:
     """DuckDB queries standing in for the INFORMATION_SCHEMA views of one database."""
     db = "'" + database.replace("'", "''") + "'"
     at = f"TIMESTAMPTZ '{started.isoformat()}'"
@@ -583,7 +614,7 @@ def _information_schema_views(database: str, started: dt.datetime) -> dict[str, 
                    CASE type_name WHEN 'NUMBER' THEN type_scale END AS "NUMERIC_SCALE",
                    CASE WHEN type_name LIKE 'TIME%' THEN 9 END AS "DATETIME_PRECISION",
                    comment AS "COMMENT"
-            FROM ({_COLUMNS_SQL}) WHERE database_name = {db}""",
+            FROM ({_columns_sql(semi_types)}) WHERE database_name = {db}""",
     }
 
 
@@ -592,7 +623,10 @@ def is_information_schema(table: exp.Table) -> bool:
 
 
 def expand_information_schema(
-    statement: exp.Expression, database: str | None, started: dt.datetime
+    statement: exp.Expression,
+    database: str | None,
+    started: dt.datetime,
+    semi_types: SemiTypes,
 ) -> None:
     """Replace references to INFORMATION_SCHEMA views with queries over DuckDB's catalog.
 
@@ -610,7 +644,7 @@ def expand_information_schema(
                 "Cannot perform SELECT. This session does not have a current database. "
                 "Call 'USE DATABASE', or use a qualified name.",
             )
-        view = _information_schema_views(catalog, started).get(table.name)
+        view = _information_schema_views(catalog, started, semi_types).get(table.name)
         if view is None:
             raise errors.unsupported(f"{INFORMATION_SCHEMA}.{table.name}")
         alias = table.alias or table.name

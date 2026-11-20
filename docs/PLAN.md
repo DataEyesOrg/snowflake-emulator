@@ -51,7 +51,7 @@ sqlglot, совместимый по протоколу с драйверами 
       `DROP UNIQUE (...)` / `DROP FOREIGN KEY (...)`
 
 Фаза 3, сделано (корпус `tests/conformance/`: `semi_structured.sql`,
-`conversion.sql` и `dates.sql`, 178 запросов, проходит в форматах JSON и Arrow
+`conversion.sql` и `dates.sql`, 195 запросов, проходит в форматах JSON и Arrow
 на коннекторах 5.2, 3.15 и 4.8):
 
 - [x] хранение `VARIANT` / `OBJECT` / `ARRAY` как канонического JSON
@@ -74,9 +74,12 @@ sqlglot, совместимый по протоколу с драйверами 
 - [ ] настоящий `TIMESTAMP_TZ` (сейчас хранится как момент без смещения);
       параметры `*_OUTPUT_FORMAT` / `*_INPUT_FORMAT`, `WEEK_START`;
       числовые форматы `TO_CHAR` / `TO_NUMBER`; наносекунды
-- [ ] `OBJECT_CONSTRUCT(*)`, `FLATTEN` с `MODE`, структурные типы
-- [ ] различать `ARRAY` / `OBJECT` / `VARIANT` в каталоге (нужно хранилище
-      метаданных)
+- [x] `OBJECT_CONSTRUCT(*)`, `FLATTEN` с `MODE`; позиционные колонки `$1` и
+      `COLUMN1` у `VALUES` (`sfemu/sql/positional.py`); `CREATE TABLE ... CLONE`
+- [ ] структурные типы (сейчас принимаются как обычные `ARRAY` / `OBJECT`)
+- [x] `ARRAY` / `OBJECT` / `VARIANT` различаются в каталоге и в типах
+      результата: тип колонки запоминается при объявлении и прослеживается
+      через CTAS, view, `LIKE`, `CLONE`, `ALTER TABLE` (`Engine.semi_types`)
 - [ ] ожидаемые результаты корпуса записаны по документации Snowflake; их
       нужно снять с настоящего аккаунта
 
