@@ -110,6 +110,8 @@ jobs:
                 protocol: http
           YAML
           uv run sfemu serve &
+          # Left running, uv holds its cache lock and the cache cannot be saved.
+          trap 'pkill -f "sfemu serve" || true' EXIT
           for _ in $(seq 30); do
             curl -sf http://127.0.0.1:8085/health && break
             sleep 1
