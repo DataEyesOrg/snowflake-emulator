@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from sfemu import variant
+
 MAX_TEXT_LENGTH = 16_777_216
 MAX_BINARY_LENGTH = 8_388_608
 
@@ -119,7 +121,9 @@ def encode_value(value: Any, column: Column) -> str | None:
     if kind == "binary":
         return bytes(value).hex().upper()
     if kind in ("variant", "array", "object"):
-        return value if isinstance(value, str) else json.dumps(value, indent=2, default=str)
+        if isinstance(value, str):
+            return variant.pretty(value)
+        return json.dumps(value, indent=2, default=str)
     return str(value)
 
 

@@ -52,6 +52,9 @@ def session_gone() -> SnowflakeError:
     )
 
 
+_JSON_ERROR = "Error parsing JSON"
+
+
 def from_duckdb(exc: duckdb.Error) -> SnowflakeError:
     detail = str(exc).strip()
     if isinstance(exc, duckdb.CatalogException):
@@ -67,4 +70,8 @@ def from_duckdb(exc: duckdb.Error) -> SnowflakeError:
         return SnowflakeError("100038", "22018", detail)
     if isinstance(exc, duckdb.ConstraintException):
         return SnowflakeError("100072", "22000", detail)
+    if _JSON_ERROR in detail:
+        # Raised by the function behind PARSE_JSON; DuckDB wraps it in its own text.
+        message = detail[detail.index(_JSON_ERROR) :].splitlines()[0]
+        return SnowflakeError("100069", "22P02", message)
     return SnowflakeError("000603", "XX000", f"SQL execution error:\n{detail}")

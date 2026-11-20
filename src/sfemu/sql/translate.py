@@ -8,6 +8,7 @@ from sqlglot.errors import ParseError, TokenError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sfemu import errors
+from sfemu.sql import semi
 
 SNOWFLAKE = "snowflake"
 DUCKDB = "duckdb"
@@ -71,11 +72,33 @@ _INTEGER_TYPES = {
 }
 
 
-def to_duckdb(statement: exp.Expression) -> str:
+_SEMI_STRUCTURED_TYPES = {
+    exp.DataType.Type.VARIANT,
+    exp.DataType.Type.OBJECT,
+    exp.DataType.Type.ARRAY,
+    exp.DataType.Type.MAP,
+}
+
+
+def to_duckdb(statement: exp.Expression, lookup: semi.Lookup | None = None) -> str:
+    return compile(statement, lookup)[0]
+
+
+def compile(
+    statement: exp.Expression, lookup: semi.Lookup | None = None
+) -> tuple[str, list[str | None] | None]:
+    """DuckDB SQL for a statement, and the kinds of its result columns where known.
+
+    ``lookup`` tells the kinds of a table's columns; see :mod:`sfemu.sql.semi`.
+    """
     statement = statement.copy()  # keep Snowflake's types in the caller's tree
+    kinds = semi.rewrite(statement, lookup)
     for data_type in list(statement.find_all(exp.DataType)):
         if data_type.this in _INTEGER_TYPES:
             data_type.replace(exp.DataType.build("DECIMAL(38, 0)"))
+        elif data_type.this in _SEMI_STRUCTURED_TYPES:
+            # VARIANT, OBJECT and ARRAY are all kept as JSON: see sfemu.variant.
+            data_type.replace(exp.DataType.build("JSON", dialect=DUCKDB))
     for merge in statement.find_all(exp.Merge):
         # DuckDB takes bare column names as the targets of UPDATE SET.
         for update in merge.find_all(exp.Update):
@@ -88,7 +111,7 @@ def to_duckdb(statement: exp.Expression) -> str:
             if isinstance(prop, exp.TransientProperty | exp.CopyGrantsProperty):
                 prop.pop()
     # Every identifier is quoted so DuckDB stores the case Snowflake would.
-    return statement.sql(dialect=DUCKDB, identify=True)
+    return statement.sql(dialect=DUCKDB, identify=True), kinds
 
 
 def bind_count(statement: exp.Expression) -> int:
@@ -117,6 +140,10 @@ def check_supported(statement: exp.Expression) -> None:
     for node in statement.walk():
         if id(node) in scans or id(node.parent) in scans and node is node.parent.this:
             continue  # the executor answers RESULT_SCAN itself
+        if isinstance(node, exp.Anonymous) and node.name.upper() in semi.FUNCTIONS:
+            continue
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Explode):
+            continue  # FLATTEN without TABLE( ) around it
         if isinstance(node, exp.Anonymous):
             # A function sqlglot has no Snowflake model for goes to DuckDB by
             # name: at best a DuckDB function (list_value), at worst a

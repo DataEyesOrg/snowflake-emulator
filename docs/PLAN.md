@@ -5,7 +5,7 @@ sqlglot, совместимый по протоколу с драйверами 
 
 ## Состояние
 
-Фаза 1 закрыта, идёт фаза 2. Сделано и проверено автотестами на
+Фазы 1 и 2 сделаны (кроме прогона на реальном dbt-проекте), идёт фаза 3. Сделано и проверено автотестами на
 `snowflake-connector-python` 5.2, 3.15 и 4.8 и на Snowflake CLI 3.34:
 
 - [x] логин, сессия, логаут (продление токена и heartbeat проверены только сырым HTTP)
@@ -50,8 +50,31 @@ sqlglot, совместимый по протоколу с драйверами 
 - [ ] переименование в другую базу; `SHOW EXPORTED KEYS`,
       `DROP UNIQUE (...)` / `DROP FOREIGN KEY (...)`
 
-Фаза 0 пропущена и остаётся открытой: спайк на fakesnow и conformance-тесты
-против настоящего аккаунта ещё не сделаны.
+Фаза 3, сделано (корпус `tests/conformance/semi_structured.sql`, 90 запросов,
+проходит в форматах JSON и Arrow на коннекторах 5.2, 3.15 и 4.8):
+
+- [x] хранение `VARIANT` / `OBJECT` / `ARRAY` как канонического JSON
+      (`sfemu/variant.py`); JSON `null` отличается от SQL `NULL`
+- [x] пути `v:a.b[0]`, `v['a']`, `GET`, `GET_PATH`; `PARSE_JSON`, `TO_VARIANT`,
+      `TO_JSON`; `OBJECT_CONSTRUCT`, `OBJECT_*`, `ARRAY_*`, `ARRAY_AGG`,
+      `OBJECT_AGG`; `TYPEOF`, `IS_*`, `AS_*`
+- [x] `FLATTEN`: lateral и `TABLE(...)`, `PATH`, `OUTER`, `RECURSIVE`
+- [x] неявное приведение `VARIANT` в сравнениях, арифметике и функциях; тип
+      колонки прослеживается через таблицы, view, CTE и подзапросы
+      (`sfemu/sql/semi.py`)
+- [x] каркас conformance-тестов: `tests/conformance/*.sql` и раннер
+      `tests/test_conformance.py`
+- [ ] `TRY_*` (`TRY_CAST`, `TRY_TO_NUMBER`, `TRY_TO_DATE`, ...)
+- [ ] даты и таймзоны: `DATEADD` / `DATEDIFF` / `DATE_TRUNC`, форматы
+      `TO_CHAR` / `TO_DATE`, `CONVERT_TIMEZONE`, `TIMESTAMP_TZ`
+- [ ] `OBJECT_CONSTRUCT(*)`, `FLATTEN` с `MODE`, структурные типы
+- [ ] различать `ARRAY` / `OBJECT` / `VARIANT` в каталоге (нужно хранилище
+      метаданных)
+- [ ] ожидаемые результаты корпуса записаны по документации Snowflake; их
+      нужно снять с настоящего аккаунта
+
+Фаза 0 пропущена и остаётся открытой: спайк на fakesnow не сделан, корпус
+conformance-тестов начат в фазе 3, но с настоящим аккаунтом ещё не сверен.
 
 ## Почему не на коде LocalStack
 

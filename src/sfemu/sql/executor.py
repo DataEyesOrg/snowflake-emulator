@@ -14,7 +14,7 @@ import uuid
 import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from functools import partial
 from typing import Any
@@ -38,7 +38,7 @@ from sfemu.engine import (
 )
 from sfemu.errors import SnowflakeError
 from sfemu.session import DEFAULT_PARAMETERS, Session
-from sfemu.sql import metadata, translate
+from sfemu.sql import metadata, semi, translate
 from sfemu.types import Column, column_from_duckdb, encode_value, fixed_column, text_column
 
 # Statement type ids as Snowflake reports them. Drivers classify by family
@@ -459,7 +459,7 @@ class Executor:
         type_id, names = dml
         self._check(session, statement)
         truncate = _pop_overwrite(session, statement)
-        sql = translate.to_duckdb(statement)
+        sql = translate.to_duckdb(statement, self._lookup(session))
         cursor = session.cursor
         affected = 0
         with _atomic(session):
@@ -525,9 +525,28 @@ class Executor:
         statement: exp.Expression,
         params: list,
         creating: exp.Table | None = None,
-    ) -> None:
+    ) -> list[str | None] | None:
+        """Check and run a statement; return the kinds of its result columns, if known."""
         self._check(session, statement, creating)
-        session.cursor.execute(translate.to_duckdb(statement), params)
+        sql, kinds = translate.compile(statement, self._lookup(session))
+        session.cursor.execute(sql, params)
+        return kinds
+
+    def _lookup(self, session: Session) -> semi.Lookup:
+        """How the SQL rewrites learn the kinds of a table's columns: from the catalog."""
+
+        def columns(table: exp.Table) -> dict[str, str | None] | None:
+            database, schema, name = _qualify(session, table)
+            if database is None or schema is None:
+                return None
+            found = session.cursor.execute(
+                "SELECT column_name, data_type FROM duckdb_columns() "
+                "WHERE database_name = ? AND schema_name = ? AND table_name = ?",
+                [database, schema, name],
+            ).fetchall()
+            return {column: _column_kind(data_type) for column, data_type in found} or None
+
+        return columns
 
     def _check(
         self, session: Session, statement: exp.Expression, creating: exp.Table | None = None
@@ -630,9 +649,18 @@ class Executor:
 
     def _query(self, session: Session, statement: exp.Expression, params: list) -> QueryResult:
         translate.name_projections(statement)
-        self._run(session, statement, params)
+        kinds = self._run(session, statement, params)
         cursor = session.cursor
         columns = [column_from_duckdb(d[0], d[1]) for d in cursor.description]
+        if kinds is not None and len(kinds) == len(columns):
+            # DuckDB holds every semi-structured value as JSON; whether a
+            # column is an ARRAY or an OBJECT is known from the statement.
+            columns = [
+                replace(column, type=kind.lower())
+                if column.type == "variant" and kind in (semi.ARRAY, semi.OBJECT)
+                else column
+                for column, kind in zip(columns, kinds, strict=True)
+            ]
         types = [str(d[1]) for d in cursor.description]
         chunk_rows = _chunk_rows(session)
         if _result_format(session) == ARROW:
@@ -686,7 +714,7 @@ class Executor:
     ) -> QueryResult:
         self._check(session, statement)
         truncate = _pop_overwrite(session, statement)
-        sql = translate.to_duckdb(statement)
+        sql = translate.to_duckdb(statement, self._lookup(session))
         with _atomic(session):
             if truncate:
                 session.cursor.execute(truncate)
@@ -1029,7 +1057,7 @@ class Executor:
             "deleted": any(not isinstance(then, exp.Insert | exp.Update) for then in thens),
         }
         # DuckDB reports one total; Snowflake a count per kind of action taken.
-        sql = translate.to_duckdb(statement) + " RETURNING merge_action"
+        sql = translate.to_duckdb(statement, self._lookup(session)) + " RETURNING merge_action"
         actions = [row[0] for row in session.cursor.execute(sql, params).fetchall()]
         tally = {
             "inserted": actions.count("INSERT"),
@@ -1223,6 +1251,23 @@ def _arrow_table(rows: list[Any], width: int) -> pa.Table | None:
         return pa.table({f"c{i}": pa.array([row[i] for row in rows]) for i in range(width)})
     except (pa.ArrowException, TypeError, ValueError, OverflowError):
         return None
+
+
+def _column_kind(data_type: str) -> str:
+    """The kind, as sfemu.sql.semi understands it, of a DuckDB column type."""
+    if data_type == "JSON":
+        return semi.VARIANT
+    if data_type.startswith("DECIMAL") or data_type.endswith("INT"):
+        return semi.NUMBER
+    if data_type in ("DOUBLE", "FLOAT"):
+        return semi.NUMBER
+    if data_type == "VARCHAR":
+        return semi.TEXT
+    if data_type == "BOOLEAN":
+        return semi.BOOLEAN
+    if data_type.startswith(("DATE", "TIME")):
+        return semi.TEMPORAL
+    return "OTHER"
 
 
 def _schema_target(session: Session, target: exp.Table, action: str) -> tuple[str, str]:

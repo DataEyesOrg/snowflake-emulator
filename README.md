@@ -75,6 +75,7 @@ append) models.
 |---|---|
 | Protocol | login, query, logout; JSON and Arrow result formats; multi-statement requests (`num_statements`, `MULTI_STATEMENT_COUNT`); results and status of a recent query by its id |
 | Queries | `SELECT` and set operations, translated by sqlglot; `RESULT_SCAN` and `LAST_QUERY_ID` over the results of recent statements |
+| Semi-structured | `VARIANT`, `OBJECT` and `ARRAY` columns and values; paths (`v:a.b[0]`, `v['a']`, `GET`, `GET_PATH`); `PARSE_JSON`, `TRY_PARSE_JSON`, `CHECK_JSON`, `TO_VARIANT`, `TO_JSON`, `TO_ARRAY`; `OBJECT_CONSTRUCT` (also `_KEEP_NULL`), `OBJECT_INSERT` / `DELETE` / `PICK` / `KEYS`, `OBJECT_AGG`; `ARRAY_CONSTRUCT`, `ARRAY_AGG` and the `ARRAY_*` functions; `FLATTEN` with `PATH`, `OUTER` and `RECURSIVE`; `TYPEOF`, `IS_*`, `AS_*`; the implicit conversion of a `VARIANT` compared with or used as a typed value |
 | DML | `INSERT`, `INSERT OVERWRITE`, `UPDATE`, `DELETE`, `MERGE`, with Snowflake's row-count result sets |
 | DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, also into another schema; `SWAP WITH`; add / drop / rename / retype column; primary keys; comments); `COMMENT ON` |
 | Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`), columns, primary, unique and imported keys, session parameters; `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
@@ -139,10 +140,33 @@ they do on Snowflake.
 - `/` on integers gives a `FLOAT`, where Snowflake gives a `NUMBER` with six
   decimal places.
 
+Semi-structured data:
+
+- `VARIANT`, `OBJECT` and `ARRAY` are stored alike, so `DESCRIBE`, `SHOW
+  COLUMNS` and `INFORMATION_SCHEMA` report all three as `VARIANT`. A result
+  column is typed `ARRAY` or `OBJECT` when the query itself shows it to be
+  one (`ARRAY_CONSTRUCT(...)`, `OBJECT_CONSTRUCT(...)`), else `VARIANT`.
+- Arithmetic, `SUM` and `AVG` on a `VARIANT` give a `FLOAT`. `MIN` and `MAX`
+  of a `VARIANT` compare the values as text.
+- A value put into a `VARIANT` keeps no type of its own beyond JSON's: a date
+  or timestamp becomes a string, and `TYPEOF` reports a `FLOAT` as `DECIMAL`.
+  A number taken out of a document keeps about 17 significant digits.
+- SQL `NULL` inside `ARRAY_CONSTRUCT` becomes JSON `null`; Snowflake keeps it
+  apart as `undefined`.
+- The conversion of a `VARIANT` in a comparison relies on knowing that the
+  operand is one. That is followed through tables, views, CTEs, subqueries
+  and `FLATTEN`; where it cannot be, the comparison fails rather than
+  compares wrongly.
+- An unaliased path is named after sqlglot's rendering (`GET_PATH(V, 'a')`),
+  where Snowflake names it `V:a`.
+- Not supported: `OBJECT_CONSTRUCT(*)`, `FLATTEN` with a `MODE`, structured
+  types (`ARRAY(NUMBER)`, `OBJECT(a INT)`, `MAP`).
+
 ## Development
 
 ```sh
 uv run pytest        # runs the real Snowflake connector against the emulator
+uv run pytest tests/test_conformance.py   # only the corpus in tests/conformance
 uv run ruff check .
 uv run ruff format .
 ```

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 import duckdb
 
+from sfemu import variant
+
 DEFAULT_SCHEMA = "PUBLIC"
 # DuckDB's own catalogs, never visible as Snowflake databases.
 INTERNAL_DATABASES = ("memory", "system", "temp")
@@ -48,6 +50,7 @@ class Engine:
         # It cannot be switched back on while the database is running.
         self._root = duckdb.connect(":memory:", config={"enable_external_access": False})
         self._catalog_lock = threading.Lock()
+        variant.install(self._root)
         # DuckDB keeps no creation times; every object is reported as created now.
         self.started = dt.datetime.now(dt.UTC).replace(microsecond=0)
         # Key constraints by table. Snowflake records them without enforcing

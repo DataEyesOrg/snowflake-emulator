@@ -20,6 +20,7 @@ from sqlglot import exp
 
 from sfemu import errors
 from sfemu.engine import FOREIGN_KEY, INTERNAL_DATABASES, PRIMARY_KEY, UNIQUE, Constraint, TableKey
+from sfemu.sql import semi
 from sfemu.types import Column, fixed_column, text_column
 
 OWNER = "SYSADMIN"
@@ -614,7 +615,9 @@ def expand_information_schema(
             raise errors.unsupported(f"{INFORMATION_SCHEMA}.{table.name}")
         alias = table.alias or table.name
         query = sqlglot.parse_one(view, read="duckdb")
-        table.replace(query.subquery(exp.to_identifier(alias, quoted=True)))
+        subquery = query.subquery(exp.to_identifier(alias, quoted=True))
+        subquery.this.meta[semi.RAW] = True  # DuckDB SQL: not for the Snowflake rewrites
+        table.replace(subquery)
 
 
 # Helpers ---------------------------------------------------------------------

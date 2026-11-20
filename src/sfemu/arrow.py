@@ -88,7 +88,8 @@ def _column(column: Column, data: pa.Array) -> pa.Array:
     if kind in ("text", "variant", "array", "object"):
         # Semi-structured values travel as JSON text, exactly like in the
         # JSON result format; untyped NULL and enums become plain text.
-        if pa.types.is_string(data.type) or pa.types.is_large_string(data.type):
+        is_text = pa.types.is_string(data.type) or pa.types.is_large_string(data.type)
+        if kind == "text" and is_text:
             return data.cast(pa.string())
         return pa.array(
             [encode_value(value, column) for value in data.to_pylist()], type=pa.string()
