@@ -8,7 +8,7 @@ from sqlglot.errors import ParseError, TokenError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sfemu import errors
-from sfemu.sql import semi
+from sfemu.sql import dates, semi
 
 SNOWFLAKE = "snowflake"
 DUCKDB = "duckdb"
@@ -30,27 +30,7 @@ def parse(sql: str) -> list[exp.Expression]:
                 pair.this.set("quoted", True)
     # Unquoted identifiers fold to upper case in Snowflake; do it once, here.
     statements = [normalize_identifiers(s, dialect=SNOWFLAKE) for s in statements]
-    for statement in statements:
-        _rewrite_conversions(statement)
     return statements
-
-
-# TO_TIMESTAMP* of one argument: sqlglot models it only for literals, since what
-# it does depends on the argument's type. For text and timestamps it is a cast;
-# a number (an epoch) fails in DuckDB's cast instead of being misread.
-_CONVERSIONS = {
-    "TO_TIMESTAMP": "TIMESTAMPNTZ",
-    "TO_TIMESTAMP_NTZ": "TIMESTAMPNTZ",
-    "TO_TIMESTAMP_LTZ": "TIMESTAMPLTZ",
-    "TO_TIMESTAMP_TZ": "TIMESTAMPTZ",
-}
-
-
-def _rewrite_conversions(statement: exp.Expression) -> None:
-    for node in list(statement.find_all(exp.Anonymous)):
-        target = _CONVERSIONS.get(node.name.upper())
-        if target and len(node.expressions) == 1:
-            node.replace(exp.cast(node.expressions[0].copy(), target, dialect=SNOWFLAKE))
 
 
 def tokens(sql: str) -> list[tuple[str, str]]:
@@ -130,6 +110,10 @@ def relations(statement: exp.Expression) -> list[exp.Table]:
     ]
 
 
+# Functions sqlglot has no model for that the rewrites answer.
+_ANSWERED = semi.FUNCTIONS | dates.FUNCTIONS
+
+
 def check_supported(statement: exp.Expression) -> None:
     """Reject what would run on DuckDB but is not Snowflake.
 
@@ -140,7 +124,7 @@ def check_supported(statement: exp.Expression) -> None:
     for node in statement.walk():
         if id(node) in scans or id(node.parent) in scans and node is node.parent.this:
             continue  # the executor answers RESULT_SCAN itself
-        if isinstance(node, exp.Anonymous) and node.name.upper() in semi.FUNCTIONS:
+        if isinstance(node, exp.Anonymous) and node.name.upper() in _ANSWERED:
             continue
         if isinstance(node, exp.Table) and isinstance(node.this, exp.Explode):
             continue  # FLATTEN without TABLE( ) around it

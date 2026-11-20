@@ -76,6 +76,8 @@ append) models.
 | Protocol | login, query, logout; JSON and Arrow result formats; multi-statement requests (`num_statements`, `MULTI_STATEMENT_COUNT`); results and status of a recent query by its id |
 | Queries | `SELECT` and set operations, translated by sqlglot; `RESULT_SCAN` and `LAST_QUERY_ID` over the results of recent statements |
 | Semi-structured | `VARIANT`, `OBJECT` and `ARRAY` columns and values; paths (`v:a.b[0]`, `v['a']`, `GET`, `GET_PATH`); `PARSE_JSON`, `TRY_PARSE_JSON`, `CHECK_JSON`, `TO_VARIANT`, `TO_JSON`, `TO_ARRAY`; `OBJECT_CONSTRUCT` (also `_KEEP_NULL`), `OBJECT_INSERT` / `DELETE` / `PICK` / `KEYS`, `OBJECT_AGG`; `ARRAY_CONSTRUCT`, `ARRAY_AGG` and the `ARRAY_*` functions; `FLATTEN` with `PATH`, `OUTER` and `RECURSIVE`; `TYPEOF`, `IS_*`, `AS_*`; the implicit conversion of a `VARIANT` compared with or used as a typed value |
+| Conversion | `TRY_CAST`, `TRY_TO_NUMBER` / `DECIMAL` / `DOUBLE` / `BOOLEAN` / `DATE` / `TIME` / `TIMESTAMP*` and their `TO_*` forms; `TO_TIMESTAMP` of text, of an epoch number and of a string of digits |
+| Dates and times | `DATEADD`, `DATEDIFF`, `DATE_TRUNC`, `LAST_DAY`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `NEXT_DAY`, `*_FROM_PARTS`, `EXTRACT` and the `YEAR` ... `DAYOFWEEKISO` family, `INTERVAL` arithmetic, with a `DATE` staying a `DATE`; `TO_CHAR` and `TO_DATE` / `TO_TIME` / `TO_TIMESTAMP` with format models; `CONVERT_TIMEZONE`; timestamps as text in Snowflake's default formats |
 | DML | `INSERT`, `INSERT OVERWRITE`, `UPDATE`, `DELETE`, `MERGE`, with Snowflake's row-count result sets |
 | DDL | `CREATE` / `DROP` for databases, schemas, tables (also transient and temporary), views; `TRUNCATE`; `ALTER TABLE` / `VIEW` (rename, also into another schema; `SWAP WITH`; add / drop / rename / retype column; primary keys; comments); `COMMENT ON` |
 | Catalog | `SHOW` databases, schemas, objects, tables, views (with `TERSE`, `LIKE`, `STARTS WITH`, `LIMIT ... FROM`), columns, primary, unique and imported keys, session parameters; `DESCRIBE TABLE` / `VIEW`; `INFORMATION_SCHEMA` views `SCHEMATA`, `TABLES`, `VIEWS`, `COLUMNS` |
@@ -109,6 +111,8 @@ they do on Snowflake.
 
 - The session time zone defaults to `UTC`, not `America/Los_Angeles`.
 - `TIMESTAMP_TZ` values lose their offset and come back as `TIMESTAMP_LTZ`.
+  For the same reason `CONVERT_TIMEZONE` with two arguments returns the
+  target zone's wall clock as a `TIMESTAMP_NTZ`.
 - Integer types are `NUMBER(38, 0)`, but an integer literal is still a DuckDB
   integer, so arithmetic on literals alone can overflow (`2147483647 + 1`).
 - Column names are matched case-insensitively (`"id"` finds `ID`); table and
@@ -139,6 +143,25 @@ they do on Snowflake.
   listed as ordinary ones. View definitions are shown as DuckDB rewrote them.
 - `/` on integers gives a `FLOAT`, where Snowflake gives a `NUMBER` with six
   decimal places.
+
+Dates and conversions:
+
+- Timestamps and times keep microseconds, not nanoseconds.
+- `DATEADD`, `DATE_TRUNC` and `+ INTERVAL` return a `DATE` for a `DATE` when
+  the argument is known to be one, which is followed the same way as for
+  `VARIANT` (see below). Where it is not known the result is a
+  `TIMESTAMP_NTZ` with the same value.
+- A timestamp becomes text in Snowflake's default formats. The session's
+  `*_OUTPUT_FORMAT` and `*_INPUT_FORMAT` parameters are accepted but not
+  applied, and neither are `WEEK_START` and `WEEK_OF_YEAR_POLICY`.
+- Text is read as a date by DuckDB's rules: ISO dates and timestamps, and a
+  string of digits as an epoch. Snowflake's guessing of other layouts
+  (`15-Jan-2024`, `01/15/2024`) is not there; give `TO_DATE` a format.
+- Format models know `YYYY`, `YY`, `MM`, `MON`, `MMMM`, `DD`, `DY`, `HH24`,
+  `HH12`, `AM` / `PM`, `MI`, `SS`, `FF0`-`FF9`, `TZH` and `TZM`; anything else
+  in a format stands for itself. A format must be a literal.
+- Not supported: numeric formats in `TO_CHAR` and `TO_NUMBER`
+  (`'999,999.00'`), `TRY_TO_BINARY`.
 
 Semi-structured data:
 

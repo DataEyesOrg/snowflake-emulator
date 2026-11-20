@@ -1265,8 +1265,14 @@ def _column_kind(data_type: str) -> str:
         return semi.TEXT
     if data_type == "BOOLEAN":
         return semi.BOOLEAN
-    if data_type.startswith(("DATE", "TIME")):
-        return semi.TEMPORAL
+    if data_type == "DATE":
+        return semi.DATE
+    if data_type == "TIMESTAMP WITH TIME ZONE":
+        return semi.TIMESTAMP_LTZ
+    if data_type.startswith("TIMESTAMP"):
+        return semi.TIMESTAMP
+    if data_type.startswith("TIME"):
+        return semi.TIME
     return "OTHER"
 
 

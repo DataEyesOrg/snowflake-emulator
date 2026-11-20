@@ -50,8 +50,9 @@ sqlglot, совместимый по протоколу с драйверами 
 - [ ] переименование в другую базу; `SHOW EXPORTED KEYS`,
       `DROP UNIQUE (...)` / `DROP FOREIGN KEY (...)`
 
-Фаза 3, сделано (корпус `tests/conformance/semi_structured.sql`, 90 запросов,
-проходит в форматах JSON и Arrow на коннекторах 5.2, 3.15 и 4.8):
+Фаза 3, сделано (корпус `tests/conformance/`: `semi_structured.sql`,
+`conversion.sql` и `dates.sql`, 178 запросов, проходит в форматах JSON и Arrow
+на коннекторах 5.2, 3.15 и 4.8):
 
 - [x] хранение `VARIANT` / `OBJECT` / `ARRAY` как канонического JSON
       (`sfemu/variant.py`); JSON `null` отличается от SQL `NULL`
@@ -64,9 +65,15 @@ sqlglot, совместимый по протоколу с драйверами 
       (`sfemu/sql/semi.py`)
 - [x] каркас conformance-тестов: `tests/conformance/*.sql` и раннер
       `tests/test_conformance.py`
-- [ ] `TRY_*` (`TRY_CAST`, `TRY_TO_NUMBER`, `TRY_TO_DATE`, ...)
-- [ ] даты и таймзоны: `DATEADD` / `DATEDIFF` / `DATE_TRUNC`, форматы
-      `TO_CHAR` / `TO_DATE`, `CONVERT_TIMEZONE`, `TIMESTAMP_TZ`
+- [x] `TRY_*` и `TO_*`: `TRY_CAST`, `TRY_TO_NUMBER`, `TRY_TO_DATE`,
+      `TRY_TO_TIMESTAMP*`, `TO_TIMESTAMP` от текста, числа и строки цифр
+- [x] даты: `DATEADD` / `DATEDIFF` / `DATE_TRUNC` и остальные функции, `DATE`
+      остаётся `DATE`; форматы `TO_CHAR` / `TO_DATE`; `CONVERT_TIMEZONE`;
+      текстовый вид timestamp как в Snowflake (`sfemu/sql/dates.py`,
+      `sfemu/temporal.py`)
+- [ ] настоящий `TIMESTAMP_TZ` (сейчас хранится как момент без смещения);
+      параметры `*_OUTPUT_FORMAT` / `*_INPUT_FORMAT`, `WEEK_START`;
+      числовые форматы `TO_CHAR` / `TO_NUMBER`; наносекунды
 - [ ] `OBJECT_CONSTRUCT(*)`, `FLATTEN` с `MODE`, структурные типы
 - [ ] различать `ARRAY` / `OBJECT` / `VARIANT` в каталоге (нужно хранилище
       метаданных)

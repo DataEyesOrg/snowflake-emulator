@@ -24,7 +24,9 @@ from sfemu import errors, variant
 
 # The kinds of value the rewrite tells apart.
 VARIANT, ARRAY, OBJECT = "VARIANT", "ARRAY", "OBJECT"
-NUMBER, TEXT, BOOLEAN, TEMPORAL = "NUMBER", "TEXT", "BOOLEAN", "TEMPORAL"
+NUMBER, TEXT, BOOLEAN = "NUMBER", "TEXT", "BOOLEAN"
+DATE, TIME, TIMESTAMP, TIMESTAMP_LTZ = "DATE", "TIME", "TIMESTAMP", "TIMESTAMP_LTZ"
+TEMPORAL = frozenset({DATE, TIME, TIMESTAMP, TIMESTAMP_LTZ})
 SEMI = frozenset({VARIANT, ARRAY, OBJECT})
 
 # Column name to kind for a table or view, or None if there is no such relation.
@@ -64,8 +66,15 @@ def type_kind(data_type: exp.DataType) -> str | None:
         return TEXT
     if this in exp.DataType.NUMERIC_TYPES:
         return NUMBER
+    if this == _TYPE.DATE:
+        return DATE
+    if this in (_TYPE.TIME, _TYPE.TIMETZ):
+        return TIME
+    if this in (_TYPE.TIMESTAMPLTZ, _TYPE.TIMESTAMPTZ):
+        # TIMESTAMP_TZ is kept as an instant too: see sfemu.sql.dates.
+        return TIMESTAMP_LTZ
     if this in exp.DataType.TEMPORAL_TYPES:
-        return TEMPORAL
+        return TIMESTAMP
     if this == _TYPE.BOOLEAN:
         return BOOLEAN
     return None
@@ -227,35 +236,35 @@ def _json() -> exp.DataType:
     return exp.DataType.build("JSON", dialect="duckdb")
 
 
-def _marked(node: exp.Expression, kind: str | None) -> exp.Expression:
+def marked(node: exp.Expression, kind: str | None) -> exp.Expression:
     node.meta[_KIND] = kind
     return node
 
 
-def _call(name: str, *arguments: exp.Expression, kind: str | None) -> exp.Expression:
+def call(name: str, *arguments: exp.Expression, kind: str | None) -> exp.Expression:
     call = exp.Anonymous(this=f"{variant.SCHEMA}.{name}", expressions=list(arguments))
-    return _marked(call, kind)
+    return marked(call, kind)
 
 
-def _text(value: exp.Expression) -> exp.Expression:
+def text(value: exp.Expression) -> exp.Expression:
     """A VARIANT as the text Snowflake converts it to."""
-    return _call("sf_text", value, kind=TEXT)
+    return call("sf_text", value, kind=TEXT)
 
 
 def _as(value: exp.Expression, kind: str | None) -> exp.Expression:
     """A VARIANT converted for a comparison with, or use as, a value of another kind."""
     if kind == NUMBER:
-        return _marked(exp.cast(_text(value), "DOUBLE"), NUMBER)
+        return marked(exp.cast(text(value), "DOUBLE"), NUMBER)
     if kind == BOOLEAN:
-        return _marked(exp.cast(_text(value), "BOOLEAN"), BOOLEAN)
-    return _text(value)
+        return marked(exp.cast(text(value), "BOOLEAN"), BOOLEAN)
+    return text(value)
 
 
 def _literal_json(text: str, kind: str) -> exp.Expression:
-    return _marked(exp.Cast(this=exp.Literal.string(text), to=_json()), kind)
+    return marked(exp.Cast(this=exp.Literal.string(text), to=_json()), kind)
 
 
-def _swap(node: exp.Expression, build: Callable[[], exp.Expression]) -> exp.Expression:
+def swap(node: exp.Expression, build: Callable[[], exp.Expression]) -> exp.Expression:
     """Put what ``build`` returns in the place of ``node``.
 
     The place is noted first: ``build`` may move ``node`` or its children into
@@ -301,6 +310,9 @@ class _Rewriter:
         return node.meta[_KIND]
 
     def _infer(self, node: exp.Expression) -> str | None:
+        found = dates.infer(self, node)
+        if found is not NotImplemented:
+            return found
         if isinstance(node, exp.Paren | exp.Alias | exp.WithinGroup | exp.Window | exp.Filter):
             return self.kind(node.this)
         if isinstance(node, exp.Subquery):
@@ -432,18 +444,20 @@ class _Rewriter:
         """A value as a VARIANT. TO_JSON leaves what already is JSON alone."""
         if self.kind(value) in SEMI:
             return value
-        return _marked(exp.Anonymous(this="TO_JSON", expressions=[value]), VARIANT)
+        return marked(exp.Anonymous(this="TO_JSON", expressions=[value]), VARIANT)
 
     def _rewrite(self, node: exp.Expression) -> None:
+        if dates.rewrite(self, node):
+            return
         for cls, macro, kind in _ARRAY_UNARY:
             if isinstance(node, cls):
-                _swap(node, lambda m=macro, k=kind: _call(m, self._variant(node.this), kind=k))
+                swap(node, lambda m=macro, k=kind: call(m, self._variant(node.this), kind=k))
                 return
         for cls, macro, value_first, kind in _ARRAY_BINARY:
             if isinstance(node, cls):
                 array, value = self._variant(node.this), self._variant(node.expression)
                 arguments = (value, array) if value_first else (array, value)
-                _swap(node, lambda m=macro, a=arguments, k=kind: _call(m, *a, kind=k))
+                swap(node, lambda m=macro, a=arguments, k=kind: call(m, *a, kind=k))
                 return
         rule = _RULES.get(type(node))
         if rule is not None:
@@ -465,7 +479,7 @@ class _Rewriter:
                 if isinstance(child, exp.Order) and child.this is not None:
                     child = child.this  # LISTAGG(x) WITHIN GROUP (ORDER BY ...) keeps x here
                 if isinstance(child, exp.Expression) and self.kind(child) in SEMI:
-                    _swap(child, lambda c=child: _as(c, kind))
+                    swap(child, lambda c=child: _as(c, kind))
 
     def _balance(self, node: exp.Expression, left: str, right: str) -> None:
         """A VARIANT compared with a typed value is converted to that value's type."""
@@ -474,32 +488,32 @@ class _Rewriter:
         if isinstance(first, exp.Null) or isinstance(second, exp.Null):
             return
         if kinds[0] in SEMI and kinds[1] not in SEMI:
-            _swap(first, lambda: _as(first, kinds[1]))
+            swap(first, lambda: _as(first, kinds[1]))
         elif kinds[1] in SEMI and kinds[0] not in SEMI:
-            _swap(second, lambda: _as(second, kinds[0]))
+            swap(second, lambda: _as(second, kinds[0]))
 
     def _cast(self, node: exp.Cast) -> None:
         target = type_kind(node.to)
         value = node.this
         if target in SEMI:
-            _swap(node, lambda: _marked(self._variant(value), target))
+            swap(node, lambda: marked(self._variant(value), target))
             return
         source = self.kind(value)
         if source in SEMI:
-            _swap(value, lambda: _text(value))
+            swap(value, lambda: text(value))
         elif source is None and isinstance(value, exp.Column):
             # A column of a kind not known here: let DuckDB, which will know
             # its type, pick the branch. The other one is folded away.
             def dispatch() -> exp.Expression:
-                unpacked = _text(exp.Cast(this=value.copy(), to=_json()))
+                unpacked = text(exp.Cast(this=value.copy(), to=_json()))
                 converted = type(node)(this=unpacked, to=node.to.copy())
                 is_json = exp.EQ(
                     this=exp.Anonymous(this="TYPEOF", expressions=[value.copy()]),
                     expression=exp.Literal.string("JSON"),
                 )
-                return _marked(exp.Case().when(is_json, converted).else_(node), target)
+                return marked(exp.Case().when(is_json, converted).else_(node), target)
 
-            _swap(node, dispatch)
+            swap(node, dispatch)
 
     def _like(self, node: exp.Expression) -> None:
         self._convert(node, TEXT)
@@ -511,14 +525,14 @@ class _Rewriter:
         kind = next((k for k in map(self.kind, items) if k is not None), TEXT)
         if kind not in SEMI:
             value = node.this
-            _swap(value, lambda: _as(value, kind))
+            swap(value, lambda: _as(value, kind))
 
     def _between(self, node: exp.Between) -> None:
         if self.kind(node.this) in SEMI:
             kind = self.kind(node.args.get("low"))
             value = node.this
             if kind not in SEMI:
-                _swap(value, lambda: _as(value, kind))
+                swap(value, lambda: _as(value, kind))
 
     def _ordered(self, node: exp.Ordered) -> None:
         """ORDER BY a VARIANT: numbers by size, and only then by their text."""
@@ -527,9 +541,9 @@ class _Rewriter:
         if self.kind(value) not in SEMI or not isinstance(order, exp.Order):
             return
         by_number = node.copy()
-        number = exp.TryCast(this=_text(value.copy()), to=exp.DataType.build("DOUBLE"))
+        number = exp.TryCast(this=text(value.copy()), to=exp.DataType.build("DOUBLE"))
         by_number.set("this", number)
-        _swap(value, lambda: _text(value))
+        swap(value, lambda: text(value))
         keys = list(order.expressions)
         keys.insert(keys.index(node), by_number)
         order.set("expressions", keys)
@@ -537,20 +551,20 @@ class _Rewriter:
     def _path(self, node: exp.Expression) -> None:
         # DuckDB's -> binds more loosely than IS NULL and the comparisons do.
         kind = self.kind(node)
-        _swap(node, lambda: _marked(exp.Paren(this=node), kind))
+        swap(node, lambda: marked(exp.Paren(this=node), kind))
 
     def _parse_json(self, node: exp.ParseJSON) -> None:
         macro = "sf_try_parse_json" if node.args.get("safe") else "sf_parse_json"
-        _swap(node, lambda: _call(macro, node.this, kind=VARIANT))
+        swap(node, lambda: call(macro, node.this, kind=VARIANT))
 
     def _check_json(self, node: exp.CheckJson) -> None:
-        _swap(node, lambda: _call("sf_check_json", node.this, kind=TEXT))
+        swap(node, lambda: call("sf_check_json", node.this, kind=TEXT))
 
     def _to_variant(self, node: exp.ToVariant) -> None:
-        _swap(node, lambda: self._variant(node.this))
+        swap(node, lambda: self._variant(node.this))
 
     def _to_json(self, node: exp.JSONFormat) -> None:
-        _swap(node, lambda: _marked(exp.cast(self._variant(node.this), "VARCHAR"), TEXT))
+        swap(node, lambda: marked(exp.cast(self._variant(node.this), "VARCHAR"), TEXT))
 
     def _get(self, node: exp.Expression) -> None:
         if isinstance(node, exp.Bracket):
@@ -559,7 +573,7 @@ class _Rewriter:
             key = node.expressions[0]
         else:
             key = node.expression
-        _swap(node, lambda: _call("sf_get", self._variant(node.this), key, kind=VARIANT))
+        swap(node, lambda: call("sf_get", self._variant(node.this), key, kind=VARIANT))
 
     def _object(self, node: exp.Expression) -> None:
         pairs = node.expressions
@@ -568,7 +582,7 @@ class _Rewriter:
             return
         macro = "sf_object_keep_null" if isinstance(node, exp.JSONObject) else "sf_object"
         if not pairs:
-            _swap(node, lambda: _literal_json("{}", OBJECT))
+            swap(node, lambda: _literal_json("{}", OBJECT))
             return
 
         def build() -> exp.Expression:
@@ -580,11 +594,11 @@ class _Rewriter:
                     exp.Literal.string(key.name) if isinstance(key, exp.Identifier) else key
                 )
                 values.append(self._variant(pair.expression))
-            return _call(
+            return call(
                 macro, exp.Array(expressions=keys), exp.Array(expressions=values), kind=OBJECT
             )
 
-        _swap(node, build)
+        swap(node, build)
 
     def _star_map(self, node: exp.StarMap) -> None:
         raise errors.unsupported("OBJECT_CONSTRUCT(*)")
@@ -596,41 +610,39 @@ class _Rewriter:
             if not items:
                 return _literal_json("[]", ARRAY)
             # JSON_ARRAY turns each argument into JSON: SQL NULL becomes JSON null.
-            array = _marked(exp.Anonymous(this="JSON_ARRAY", expressions=list(items)), ARRAY)
+            array = marked(exp.Anonymous(this="JSON_ARRAY", expressions=list(items)), ARRAY)
             if isinstance(node, exp.ArrayConstructCompact):
-                return _call("sf_array_compact", array, kind=ARRAY)
+                return call("sf_array_compact", array, kind=ARRAY)
             return array
 
-        _swap(node, build)
+        swap(node, build)
 
     def _array_to_string(self, node: exp.ArrayToString) -> None:
-        _swap(
+        swap(
             node,
-            lambda: _call(
+            lambda: call(
                 "sf_array_to_string", self._variant(node.this), node.expression, kind=TEXT
             ),
         )
 
     def _array_slice(self, node: exp.ArraySlice) -> None:
         start, end = node.args.get("start"), node.args.get("end")
-        _swap(
-            node, lambda: _call("sf_array_slice", self._variant(node.this), start, end, kind=ARRAY)
-        )
+        swap(node, lambda: call("sf_array_slice", self._variant(node.this), start, end, kind=ARRAY))
 
     def _array_concat(self, node: exp.ArrayConcat) -> None:
         def build() -> exp.Expression:
             joined = self._variant(node.this)
             for other in node.expressions:
-                joined = _call("sf_array_cat", joined, self._variant(other), kind=ARRAY)
+                joined = call("sf_array_cat", joined, self._variant(other), kind=ARRAY)
             return joined
 
-        _swap(node, build)
+        swap(node, build)
 
     def _array_insert(self, node: exp.ArrayInsert) -> None:
         position, value = node.args.get("position"), node.expression
-        _swap(
+        swap(
             node,
-            lambda: _call(
+            lambda: call(
                 "sf_array_insert",
                 self._variant(node.this),
                 position,
@@ -642,24 +654,24 @@ class _Rewriter:
     def _array_intersect(self, node: exp.ArrayIntersect) -> None:
         if len(node.expressions) == 2:
             first, second = (self._variant(item) for item in node.expressions)
-            _swap(node, lambda: _call("sf_array_intersection", first, second, kind=ARRAY))
+            swap(node, lambda: call("sf_array_intersection", first, second, kind=ARRAY))
 
     def _array_sort(self, node: exp.ArraySort) -> None:
         descending = isinstance(node.args.get("asc"), exp.Boolean) and not node.args["asc"].this
 
         def build() -> exp.Expression:
-            ordered = _call("sf_array_sort", self._variant(node.this), kind=ARRAY)
-            return _call("sf_array_reverse", ordered, kind=ARRAY) if descending else ordered
+            ordered = call("sf_array_sort", self._variant(node.this), kind=ARRAY)
+            return call("sf_array_reverse", ordered, kind=ARRAY) if descending else ordered
 
-        _swap(node, build)
+        swap(node, build)
 
     def _range(self, node: exp.GenerateSeries) -> None:
         if not node.args.get("is_end_exclusive"):
             return  # not ARRAY_GENERATE_RANGE
         bounds = [node.args[key] for key in ("start", "end", "step") if node.args.get(key)]
-        _swap(
+        swap(
             node,
-            lambda: _marked(
+            lambda: marked(
                 exp.Anonymous(
                     this="TO_JSON", expressions=[exp.Anonymous(this="RANGE", expressions=bounds)]
                 ),
@@ -669,17 +681,17 @@ class _Rewriter:
 
     def _split(self, node: exp.Split) -> None:
         # The generator's STR_SPLIT gives a DuckDB list; SPLIT returns an ARRAY.
-        _swap(node, lambda: _marked(exp.Anonymous(this="TO_JSON", expressions=[node]), ARRAY))
+        swap(node, lambda: marked(exp.Anonymous(this="TO_JSON", expressions=[node]), ARRAY))
 
     def _strtok_to_array(self, node: exp.StrtokToArray) -> None:
         delimiters = node.expression or exp.Literal.string(" ")
-        _swap(node, lambda: _call("sf_strtok_to_array", node.this, delimiters, kind=ARRAY))
+        swap(node, lambda: call("sf_strtok_to_array", node.this, delimiters, kind=ARRAY))
 
     def _array_agg(self, node: exp.Expression) -> None:
         if isinstance(node, exp.ArrayUniqueAgg):
             value = node.this
             distinct = exp.Distinct(expressions=[value])
-            node = _swap(node, lambda: exp.ArrayAgg(this=distinct, nulls_excluded=True))
+            node = swap(node, lambda: exp.ArrayAgg(this=distinct, nulls_excluded=True))
         # The values are aggregated as they are, so DISTINCT and ORDER BY see
         # them typed; TO_JSON then makes an array of a list of any type.
         # ORDER BY, OVER and FILTER wrap the aggregate; the array is made of the whole.
@@ -689,21 +701,21 @@ class _Rewriter:
         ):
             top = top.parent
             self._done.add(id(top))
-        _swap(top, lambda: _call("sf_array_agg", top, kind=ARRAY))
+        swap(top, lambda: call("sf_array_agg", top, kind=ARRAY))
 
     def _object_agg(self, node: exp.ObjectAgg) -> None:
         def build() -> exp.Expression:
             keys = exp.Anonymous(this="LIST", expressions=[node.this])
             values = exp.Anonymous(this="LIST", expressions=[self._variant(node.expression)])
-            return _call("sf_object", keys, values, kind=OBJECT)
+            return call("sf_object", keys, values, kind=OBJECT)
 
-        _swap(node, build)
+        swap(node, build)
 
     def _object_insert(self, node: exp.ObjectInsert) -> None:
         key, value = node.args.get("key"), node.args.get("value")
-        _swap(
+        swap(
             node,
-            lambda: _call(
+            lambda: call(
                 "sf_object_insert", self._variant(node.this), key, self._variant(value), kind=OBJECT
             ),
         )
@@ -713,7 +725,7 @@ class _Rewriter:
 
     def _is(self, node: exp.Expression, value: exp.Expression, macro: str, extra: list) -> None:
         literals = [exp.Literal.string(text) for text in extra]
-        _swap(node, lambda: _call(macro, self._variant(value), *literals, kind=BOOLEAN))
+        swap(node, lambda: call(macro, self._variant(value), *literals, kind=BOOLEAN))
 
     def _anonymous(self, node: exp.Anonymous) -> None:
         name = node.name.upper()
@@ -726,13 +738,13 @@ class _Rewriter:
         elif name in _AS:
             macro, extra, kind = _AS[name]
             literals = [exp.Literal.string(text) for text in extra]
-            _swap(node, lambda: _call(macro, self._variant(value), *literals, kind=kind))
+            swap(node, lambda: call(macro, self._variant(value), *literals, kind=kind))
         elif name in _OBJECT_EDITS:
             keys = exp.Array(expressions=arguments[1:])
             macro = _OBJECT_EDITS[name]
-            _swap(node, lambda: _call(macro, self._variant(value), keys, kind=OBJECT))
+            swap(node, lambda: call(macro, self._variant(value), keys, kind=OBJECT))
         elif name == "TO_OBJECT":
-            _swap(node, lambda: _marked(self._variant(value), OBJECT))
+            swap(node, lambda: marked(self._variant(value), OBJECT))
 
     def _flatten(self, node: exp.Explode) -> None:
         holder = node.parent
@@ -755,7 +767,7 @@ class _Rewriter:
         self._done.add(id(holder))
 
         def build() -> exp.Expression:
-            call = _call(
+            flattened = call(
                 "sf_flatten",
                 self._variant(options["INPUT"]),
                 options.get("PATH") or exp.Null(),
@@ -763,14 +775,14 @@ class _Rewriter:
                 options.get("RECURSIVE") or exp.false(),
                 kind=None,
             )
-            table = exp.Table(this=call)
+            table = exp.Table(this=flattened)
             alias = holder.args.get("alias")
             if alias is not None and alias.this is not None:
                 table.set("alias", exp.TableAlias(this=alias.this))
             table.meta[_FLATTEN] = True
             return table
 
-        table = _swap(holder, build)
+        table = swap(holder, build)
         join = table.parent
         if (
             isinstance(join, exp.Join)
@@ -851,3 +863,8 @@ def _cte(node: exp.Expression, name: str) -> exp.Expression | None:
                 return cte.this
         holder = holder.parent
     return None
+
+
+# The rules for dates and times. They build on what is defined above, so the
+# module can only be imported once all of it exists.
+from sfemu.sql import dates  # noqa: E402
